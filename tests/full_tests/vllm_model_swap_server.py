@@ -30,14 +30,16 @@ Usage:
   # Generate completions:
   curl -X POST http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model": "current", "prompt": "Hello", "max_tokens": 16}'
+    -d '{"model": "current", "prompt": "Hello", "max_tokens": 160}'
 """
 
 import argparse
+import asyncio
 import gc
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -57,7 +59,7 @@ from vllm_gaudi.extension.profiler import HabanaMemoryProfiler
 class CompletionRequest(BaseModel):
     model: str
     prompt: str | list[str]
-    max_tokens: int = 16
+    max_tokens: int = 160
     temperature: float = 0.0
     top_p: float = 1.0
     n: int = 1
@@ -118,6 +120,14 @@ class ServerState:
 
 
 state = ServerState()
+
+# ============================================================================
+# Thread Pool for Non-Blocking Generation
+# ============================================================================
+# Use a single-worker thread pool to prevent blocking the FastAPI event loop
+# during generation, while respecting Gaudi's single-process constraint.
+# The generate() call is synchronous, so we run it in a thread pool.
+executor = ThreadPoolExecutor(max_workers=1)
 
 
 # ============================================================================
@@ -413,9 +423,15 @@ async def completions(request: CompletionRequest):
             stop=request.stop,
         )
         
-        # Generate
+        # Generate using thread pool to avoid blocking event loop
+        # The generate() call is synchronous, so we offload it to a thread
         start = time.time()
-        outputs = state.llm.generate(prompts, sampling_params)
+        outputs = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            state.llm.generate,
+            prompts,
+            sampling_params,
+        )
         gen_time = time.time() - start
         
         # Format response

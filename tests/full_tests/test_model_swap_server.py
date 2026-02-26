@@ -87,7 +87,7 @@ def swap_model(url: str, model: str) -> dict:
     return response.json()
 
 
-def generate(url: str, prompt: str, max_tokens: int = 16) -> dict:
+def generate(url: str, prompt: str, max_tokens: int = 160) -> dict:
     """Generate completions."""
     response = requests.post(
         f"{url}/v1/completions",
@@ -137,7 +137,7 @@ def test_generation(url: str, prompt: str = "The capital of France is"):
     print(f"Prompt: '{prompt}'")
     
     start = time.time()
-    result = generate(url, prompt, max_tokens=16)
+    result = generate(url, prompt, max_tokens=160)
     elapsed = time.time() - start
     
     generated_text = result['choices'][0]['text']
@@ -213,7 +213,7 @@ def test_generation_after_swap(url: str, prompt: str = "Hello, how are"):
     print(f"Prompt: '{prompt}'")
     
     start = time.time()
-    result = generate(url, prompt, max_tokens=16)
+    result = generate(url, prompt, max_tokens=160)
     elapsed = time.time() - start
     
     generated_text = result['choices'][0]['text']
@@ -241,7 +241,7 @@ def test_multiple_swaps(url: str, model_a: str, model_b: str, cycles: int = 2):
         print(f"    Swap time: {swap_time_b:.2f}s")
         
         # Quick generation test
-        gen_result = generate(url, "Test", max_tokens=4)
+        gen_result = generate(url, "Test", max_tokens=16)
         print(f"    Generated: '{gen_result['choices'][0]['text']}'")
         
         # Swap back to model A
@@ -252,7 +252,7 @@ def test_multiple_swaps(url: str, model_a: str, model_b: str, cycles: int = 2):
         print(f"    Swap time: {swap_time_a:.2f}s")
         
         # Quick generation test
-        gen_result = generate(url, "Test", max_tokens=4)
+        gen_result = generate(url, "Test", max_tokens=16)
         print(f"    Generated: '{gen_result['choices'][0]['text']}'")
     
     # Summary
