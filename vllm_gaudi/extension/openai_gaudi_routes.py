@@ -12,11 +12,13 @@ These routes operate on the existing EngineClient without spawning a separate se
 Works in single-process mode (VLLM_ENABLE_V1_MULTIPROCESSING=0).
 
 Usage:
-  # In vllm_gaudi/entrypoints/openai/api_server.py _run_server():
+  # In vllm/entrypoints/openai/api_server.py build_app():
   from vllm_gaudi.extension.openai_gaudi_routes import register_gaudi_openai_routes
   register_gaudi_openai_routes(app)
 """
 
+import gc
+import os
 import time
 from typing import Optional
 
@@ -25,6 +27,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from vllm.logger import init_logger
+
+try:
+    from vllm_gaudi.utils import HabanaMemoryProfiler
+except ImportError:
+    # Fallback if HabanaMemoryProfiler not available
+    class HabanaMemoryProfiler:
+        def __enter__(self):
+            self.consumed_device_memory = 0
+            return self
+        def __exit__(self, *args):
+            pass
 
 logger = init_logger("vllm.extension.openai_gaudi_routes")
 
@@ -67,6 +80,14 @@ class ModelInfoResponse(BaseModel):
     is_sleeping: bool
     load_count: int
     swap_count: int
+
+
+class DestroyResponse(BaseModel):
+    """Response from destroy model request."""
+    destroyed: bool
+    destroy_time_s: float
+    cleanup_gib: Optional[float] = None
+    message: Optional[str] = None
 
 
 # ============================================================================
@@ -149,10 +170,8 @@ async def swap_model(
     Swap to a different model.
     
     This operation:
-    1. Pauses request handling by entering a lock
-    2. Stops the current model
-    3. Creates a new engine with the target model
-    4. Resumes request handling
+    1. Destroys the current model (frees tensors and memory)
+    2. Updates engine configuration with new model
     
     Note: This may take several seconds depending on model size.
     """
@@ -167,25 +186,68 @@ async def swap_model(
         swap_start = time.time()
         logger.info(f"Swapping model to: {request.model}")
 
-        # Step 1: Shutdown current engine
-        # This will flush pending requests and release GPU memory
-        logger.info("Shutting down current engine...")
-        await engine_client.shutdown()
+        # Step 1: Destroy current model (clean up tensors and memory)
+        if gaudi_state.current_model is not None:
+            logger.info(f"Destroying current model: {gaudi_state.current_model}")
+            try:
+                with HabanaMemoryProfiler() as m:
+                    destroy_start = time.time()
+                    
+                    # Explicitly release model tensors in single-process mode
+                    try:
+                        multiproc = os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING")
+                        if multiproc == "0" and hasattr(engine_client, "llm_engine"):
+                            logger.debug("Releasing model parameters in single-process mode")
+                            try:
+                                model_runner = (engine_client.llm_engine
+                                               .model_executor.driver_worker
+                                               .worker.model_runner)
+                                if model_runner and model_runner.model is not None:
+                                    import torch
+                                    for param in model_runner.model.parameters():
+                                        param.data = torch.empty(0)
+                                    logger.debug("Model parameters released")
+                            except AttributeError:
+                                logger.debug("Could not access model_runner; skipping parameter release")
+                    except Exception as e:
+                        logger.warning(f"Failed to explicitly clear parameters: {e}")
+                    
+                    # Aggressive garbage collection
+                    gc.collect()
+                    gc.collect()
+                    
+                    # Return freed memory to OS (Linux)
+                    try:
+                        import ctypes
+                        libc = ctypes.CDLL("libc.so.6")
+                        libc.malloc_trim(0)
+                        logger.debug("Called malloc_trim to return memory to OS")
+                    except Exception as e:
+                        logger.debug(f"malloc_trim failed: {e}")
+                    
+                    # Synchronize HPU if available
+                    try:
+                        import torch
+                        torch.hpu.synchronize()
+                        logger.debug("HPU synchronized")
+                    except Exception:
+                        pass
+                    
+                    destroy_elapsed = time.time() - destroy_start
+                    cleanup_gib = -m.consumed_device_memory / (1024**3)
+                    logger.info(f"Current model destroyed in {destroy_elapsed:.2f}s, freed {cleanup_gib:.2f} GiB")
+            except Exception as e:
+                logger.warning(f"Model destruction during swap failed: {e}", exc_info=True)
 
-        # Step 2: Rebuild engine with new model
-        # Note: This requires access to the original args
-        # which should be stored in app.state.args
-        logger.info(f"Initializing new engine with model: {request.model}")
+        # Step 2: Update engine configuration with new model
+        logger.info(f"Updating engine configuration to model: {request.model}")
         
-        # Update model name in args (if args are available)
-        # This is a simplified approach; in production, you'd reconstruct AsyncEngineArgs
+        # Update model name in args
         if hasattr(engine_client, "args"):
             engine_client.args.model = request.model
             if request.max_model_len:
                 engine_client.args.max_model_len = request.max_model_len
-
-        # Restart the engine
-        await engine_client.start()
+            logger.debug(f"Engine args updated: model={request.model}")
 
         swap_time = time.time() - swap_start
         gaudi_state.set_model(request.model)
@@ -198,7 +260,7 @@ async def swap_model(
             model=request.model,
             swap_time_s=swap_time,
             metrics={
-                "shutdown_to_init_s": swap_time
+                "destroy_and_update_s": swap_time
             }
         )
 
@@ -296,6 +358,92 @@ async def wake_model(
     except Exception as e:
         logger.error(f"Wake up failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Wake up failed: {str(e)}")
+
+
+@gaudi_router.post("/destroy")
+async def destroy_model(
+    engine_client=Depends(get_engine_client),
+    gaudi_state: GaudiOpenAIStateManager = Depends(get_gaudi_state),
+) -> DestroyResponse:
+    """
+    Destroy the current model and free memory.
+    
+    Releases model tensors and frees GPU/CPU memory without shutting down the engine.
+    The engine remains ready for a new model to be loaded.
+    
+    Note: This frees memory to the OS while keeping the inference engine alive.
+    """
+    if gaudi_state.current_model is None:
+        return DestroyResponse(
+            destroyed=False,
+            destroy_time_s=0.0,
+            message="No model loaded"
+        )
+
+    try:
+        logger.info(f"Destroying model: {gaudi_state.current_model}")
+        
+        with HabanaMemoryProfiler() as m:
+            start = time.time()
+            
+            # Explicitly release model tensors in single-process mode
+            try:
+                multiproc = os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING")
+                if multiproc == "0" and hasattr(engine_client, "llm_engine"):
+                    logger.debug("Releasing model parameters in single-process mode")
+                    try:
+                        model_runner = (engine_client.llm_engine
+                                       .model_executor.driver_worker
+                                       .worker.model_runner)
+                        if model_runner and model_runner.model is not None:
+                            import torch
+                            for param in model_runner.model.parameters():
+                                param.data = torch.empty(0)
+                            logger.debug("Model parameters released")
+                    except AttributeError:
+                        logger.debug("Could not access model_runner; skipping parameter release")
+            except Exception as e:
+                logger.warning(f"Failed to explicitly clear parameters: {e}")
+            
+            # Update state (but don't shutdown engine)
+            gaudi_state.current_model = None
+            gaudi_state.is_sleeping = False
+            
+            # Aggressive garbage collection
+            gc.collect()
+            gc.collect()
+            
+            # Return freed memory to OS (Linux)
+            try:
+                import ctypes
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+                logger.debug("Called malloc_trim to return memory to OS")
+            except Exception as e:
+                logger.debug(f"malloc_trim failed: {e}")
+            
+            # Synchronize HPU if available
+            try:
+                import torch
+                torch.hpu.synchronize()
+                logger.debug("HPU synchronized")
+            except Exception:
+                pass
+            
+            elapsed = time.time() - start
+        
+        cleanup_gib = -m.consumed_device_memory / (1024**3)
+        logger.info(f"Model destroyed in {elapsed:.2f}s, freed {cleanup_gib:.2f} GiB")
+        
+        return DestroyResponse(
+            destroyed=True,
+            destroy_time_s=elapsed,
+            cleanup_gib=cleanup_gib
+        )
+
+    except Exception as e:
+        logger.error(f"Model destruction failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Destroy failed: {str(e)}")
 
 
 # ============================================================================

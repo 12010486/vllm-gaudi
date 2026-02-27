@@ -28,10 +28,10 @@ from vllm.entrypoints.openai.api_server import (
     build_app,
     build_async_engine_client,
     init_app_state,
-    load_log_config,
     setup_server,
 )
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.utils import cli_env_setup
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
@@ -70,7 +70,7 @@ async def run_server_worker(
     if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
-    log_config = load_log_config(args.log_config_file)
+    log_config = get_uvicorn_log_config(args)
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
@@ -78,13 +78,16 @@ async def run_server_worker(
         args,
         client_config=client_config,
     ) as engine_client:
-        app = build_app(args)
+        supported_tasks = await engine_client.get_supported_tasks()
+        logger.info("Supported tasks: %s", supported_tasks)
+
+        app = build_app(args, supported_tasks)
 
         # Register Gaudi-specific routes BEFORE initializing app state
         register_gaudi_openai_routes(app)
         logger.info("Registered Gaudi OpenAI extension routes")
 
-        await init_app_state(engine_client, app.state, args)
+        await init_app_state(engine_client, app.state, args, supported_tasks)
 
         logger.info(
             "Starting vLLM API server %d on %s",
@@ -104,6 +107,7 @@ async def run_server_worker(
             ssl_certfile=args.ssl_certfile,
             ssl_ca_certs=args.ssl_ca_certs,
             ssl_cert_reqs=args.ssl_cert_reqs,
+            ssl_ciphers=args.ssl_ciphers,
             h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
             h11_max_header_count=args.h11_max_header_count,
             **uvicorn_kwargs,
