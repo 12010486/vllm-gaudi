@@ -1,0 +1,11 @@
+dc6de33c3d5e9026cef7b27791dfe0f98e64bbde
+# vllm-gaudi compatibility pinning:
+#   The vllm-gaudi plugin is installed on top of the vllm upstream checkout used by this CI job.
+#   When upstream vllm changes its API, the plugin may break before it has been updated.
+#   To handle this, the vllm-gaudi repository maintains a file:
+#     vllm/last-good-commit-for-vllm-gaudi/VLLM_COMMUNITY_COMMIT
+#   The first line of that file controls what version of vllm is used inside the Docker image:
+#     - "latest"        : no checkout override; the current Buildkite CI commit is used as-is.
+#     - "<commit SHA>"  : vllm is checked out to that specific commit before building, pinning
+#                         the test to a known-compatible baseline.
+#   To unpin (resume testing against the live vllm tip), set the file content back to "latest".
