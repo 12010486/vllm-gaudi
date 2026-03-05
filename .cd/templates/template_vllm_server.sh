@@ -16,10 +16,21 @@ if [ $ASYNC_SCHEDULING -gt 0 ]; then # Checks if using async scheduling
     EXTRA_ARGS+=" --async_scheduling"
 fi
 
+USE_MULTI_MODEL=0
+case "${VLLM_GAUDI_MULTI_MODEL}" in
+    1|true|TRUE|yes|YES|on|ON) USE_MULTI_MODEL=1 ;;
+esac
+
+if [ $USE_MULTI_MODEL -eq 1 ]; then
+    SERVER_CMD="python -m vllm_gaudi.entrypoints.openai.multi_model_api_server --model $MODEL"
+else
+    SERVER_CMD="vllm serve $MODEL"
+fi
+
 ## Executing command print
 
 printf "\n---------------------Starting vLLM server with the command-------------------------"
-printf "\nvllm serve $MODEL --block-size $BLOCK_SIZE --dtype $DTYPE \
+printf "\n$SERVER_CMD --block-size $BLOCK_SIZE --dtype $DTYPE \
 --tensor-parallel-size $TENSOR_PARALLEL_SIZE --download_dir $HF_HOME \
 --max-model-len $MAX_MODEL_LEN --gpu-memory-utilization $GPU_MEM_UTILIZATION \
 --max-num-seqs $MAX_NUM_SEQS --generation-config vllm \
@@ -28,7 +39,7 @@ printf "\nvllm serve $MODEL --block-size $BLOCK_SIZE --dtype $DTYPE \
 printf "\n-----------------------------------------------------------------------------------\n"
 
 ## Start server
-vllm serve $MODEL \
+$SERVER_CMD \
         --block-size $BLOCK_SIZE \
         --dtype $DTYPE \
         --tensor-parallel-size $TENSOR_PARALLEL_SIZE \
