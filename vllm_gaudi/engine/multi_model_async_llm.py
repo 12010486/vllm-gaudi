@@ -102,7 +102,18 @@ class MultiModelAsyncLLM:
                 f"Model '{model_name}' not found. Available: {list(self.model_configs.keys())}"
             )
         return self._vllm_configs[model_name]
-    
+   
+   def get_all_vllm_configs(self) -> Dict[str, VllmConfig]:
+        """
+        Get all vllm_configs for model registry building.
+
+        Returns a shallow copy to prevent external modification.
+
+        Returns:
+            Dictionary mapping model names to their VllmConfig objects
+        """
+        return self._vllm_configs.copy()
+
     @property
     def engine(self) -> AsyncLLM:
         """Return underlying AsyncLLM engine."""
@@ -153,7 +164,7 @@ class MultiModelAsyncLLM:
         sleep_level: int = 1,
     ) -> None:
         """
-        Switch to a different model.
+        Switch to a different model with error recovery
         
         Steps:
         1. Drain pending requests (with timeout)
@@ -162,6 +173,8 @@ class MultiModelAsyncLLM:
         4. Reload executor with new model config
         5. Wake up with new model
         
+        If any step fails, attempts to wake up engine to restore state.
+
         Args:
             model_name: Target model name
             drain_timeout: Seconds to wait for requests to drain
@@ -169,7 +182,8 @@ class MultiModelAsyncLLM:
         
         Raises:
             ValueError: If model not found
-            RuntimeError: If engine not initialized
+            RuntimeError: If engine not initialized or switch fails
+
         """
         async with self._switching_lock:
             if self._engine is None:
@@ -188,37 +202,61 @@ class MultiModelAsyncLLM:
             new_model = self._vllm_configs[model_name].model_config.model
             
             logger.info(f"Switching from {self._current_model_name} to {model_name}")
-            
-            # Step 1: Drain pending requests
-            logger.info("Draining pending requests...")
+
             try:
-                await asyncio.wait_for(
-                    self._engine.wait_for_requests_to_drain(drain_timeout),
-                    timeout=drain_timeout + 5,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"Drain timeout ({drain_timeout}s) exceeded. Proceeding anyway."
-                )
-            
-            # Step 2: Sleep current model (offload to CPU)
-            logger.info(f"Sleeping model: {self._current_model_name}")
-            await self._engine.sleep(level=sleep_level)
+                # Step 1: Drain pending requests
+                logger.info("Draining pending requests...")
+                try:
+                    await asyncio.wait_for(
+                        self._engine.wait_for_requests_to_drain(drain_timeout),
+                        timeout=drain_timeout + 5,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"Drain timeout ({drain_timeout}s) exceeded. Proceeding with caution."
+                    )
+                
+                # Step 2: Sleep current model (offload to CPU)
+                logger.info(f"Sleeping model: {self._current_model_name}")
+                await self._engine.sleep(level=sleep_level)
 
-            # Step 3: Unload current model weights (worker only)
-            logger.info(f"Unloading model: {self._current_model_name}")
-            await self._unload_model_executor()
+                # Step 3: Unload current model weights (worker only)
+                logger.info(f"Unloading model: {self._current_model_name}")
+                await self._unload_model_executor()
 
-            # Step 4: Reload model executor
-            logger.info(f"Reloading executor for: {model_name}")
-            await self._reload_model_executor(model_name)
+                # Step 4: Reload model executor
+                logger.info(f"Reloading executor for: {model_name}")
+                await self._reload_model_executor(model_name)
 
-            # Step 5: Wake up with new model
-            logger.info(f"Waking up with: {model_name}")
-            await self._engine.wake_up()
-            
-            self._current_model_name = model_name
-            logger.info(f"Successfully switched to: {new_model}")
+                # Step 5: Wake up with new model
+                logger.info(f"Waking up with: {model_name}")
+                await self._engine.wake_up()
+                
+                self._current_model_name = model_name
+                logger.info(f"Successfully switched to: {new_model}")
+                
+            except Exception as e:
+                logger.error(
+                    f"Model switch failed during {e.__class__.__name__}: {e}. "
+                    f"Attempting to restore engine state..."
+                 )
+                # Attempt recovery: wake up engine if it's stuck in sleep
+                try:
+                    logger.info("Attempting to wake up engine for recovery...")
+                    await self._engine.wake_up()
+                    logger.warning(
+                        f"Engine woken up. May still be in inconsistent state. "
+                        f"Manual restart recommended if issues persist."
+                    )
+                except Exception as recovery_error:
+                    logger.error(
+                        f"Recovery failed: {recovery_error.__class__.__name__}: {recovery_error}. "
+                        f"Engine may be unresponsive. Manual server restart required."                    )
+                
+                # Re-raise original exception with context
+                raise RuntimeError(
+                    f"Failed to switch model from {self._current_model_name} to {model_name}: {e}"
+
     
     async def _reload_model_executor(self, model_name: str) -> None:
         """

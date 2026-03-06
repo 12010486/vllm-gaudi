@@ -253,7 +253,6 @@ class ModelSwitchRequest(BaseModel):
     model: str = Field(..., description="Target model name")
     drain_timeout: int = Field(60, ge=0)
     sleep_level: int = Field(1, ge=0)
-    pause_mode: Literal["abort", "wait", "keep"] = "abort"
 
 
 class ModelSwitchResponse(BaseModel):
@@ -446,7 +445,6 @@ def _attach_multi_model_router(app: FastAPI) -> None:
             request.model,
             drain_timeout=request.drain_timeout,
             sleep_level=request.sleep_level,
-            pause_mode=request.pause_mode,
         )
         await _init_multi_model_state(
             engine_client,
