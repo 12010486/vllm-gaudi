@@ -3,13 +3,9 @@
 """Multi-model support for AsyncLLM on Gaudi platform.
 
 This module provides a wrapper around AsyncLLM that enables dynamic model
-switching without destroying and recreating the engine. This is particularly
-useful for scenarios like:
-- Multi-tenant serving with different models per tenant
-- A/B testing with multiple models
-- Dynamic model selection based on workload
+switching without destroying and recreating the engine.
 
-The implementation uses vLLM's sleep/wake mechanism combined with dynamic
+The implementation uses vLLM's sleep/wake-up mechanism combined with dynamic
 model reloading through the collective RPC interface.
 """
 
@@ -40,49 +36,6 @@ class MultiModelAsyncLLM:
     2. Using sleep() to offload current model to CPU
     3. Reloading model executor with new config via collective RPC
     4. Using wake_up() to resume with new model
-    
-    Example:
-        >>> from vllm.engine.arg_utils import AsyncEngineArgs
-        >>> from vllm_gaudi.engine import MultiModelAsyncLLM
-        >>> 
-        >>> # Define models
-        >>> models = {
-        ...     "model_a": AsyncEngineArgs(
-        ...         model="meta-llama/Llama-3.1-8B-Instruct",
-        ...         max_model_len=4096,
-        ...     ),
-        ...     "model_b": AsyncEngineArgs(
-        ...         model="Qwen/Qwen3-0.6B",
-        ...         max_model_len=4096,
-        ...     )
-        ... }
-        >>> 
-        >>> # Create manager
-        >>> manager = MultiModelAsyncLLM(models)
-        >>> await manager.initialize("model_a")
-        >>> 
-        >>> # Generate with model_a
-        >>> from vllm import SamplingParams
-        >>> async for output in manager.generate(
-        ...     "Hello, my name is",
-        ...     SamplingParams(max_tokens=20),
-        ...     "request-1"
-        ... ):
-        ...     print(output.outputs[0].text)
-        >>> 
-        >>> # Switch to model_b
-        >>> await manager.switch_model("model_b")
-        >>> 
-        >>> # Generate with model_b
-        >>> async for output in manager.generate(
-        ...     "The capital of France is",
-        ...     SamplingParams(max_tokens=20),
-        ...     "request-2"
-        ... ):
-        ...     print(output.outputs[0].text)
-        >>> 
-        >>> # Cleanup
-        >>> manager.shutdown()
     
     Note:
         - Model switching incurs overhead (sleep, reload, wake operations)

@@ -50,3 +50,23 @@ def register_models():
     import vllm_gaudi.models.roberta  # noqa: F401
     from .models import register_model
     register_model()
+
+def get_multi_model_engine():
+    """
+    Get MultiModelAsyncLLM for dynamic model switching.
+
+    Returns:
+        MultiModelAsyncLLM class
+    """
+    from vllm_gaudi.engine import MultiModelAsyncLLM
+    return MultiModelAsyncLLM
+
+
+__all__ = [
+    "register",
+    "register_utils",
+    "register_ops",
+    "register_models",
+    "get_multi_model_engine",
+]
+
