@@ -66,6 +66,11 @@ class MultiModelAsyncLLM:
             disable_log_stats: Disable stats logging
             enable_log_requests: Enable request logging
         """
+        self._engine: Optional[AsyncLLM] = None
+        self._current_model_name: Optional[str] = None
+        self._vllm_configs: Dict[str, VllmConfig] = {}
+        self._switching_lock = asyncio.Lock()
+
         if not model_configs:
             raise ValueError("model_configs cannot be empty")
         
@@ -73,11 +78,6 @@ class MultiModelAsyncLLM:
         self.usage_context = usage_context
         self.disable_log_stats = disable_log_stats
         self.enable_log_requests = enable_log_requests
-        
-        self._engine: Optional[AsyncLLM] = None
-        self._current_model_name: Optional[str] = None
-        self._vllm_configs: Dict[str, VllmConfig] = {}
-        self._switching_lock = asyncio.Lock()
         
         # Pre-create VllmConfig for each model
         logger.info(f"Creating configs for {len(model_configs)} models")
@@ -103,7 +103,7 @@ class MultiModelAsyncLLM:
             )
         return self._vllm_configs[model_name]
    
-   def get_all_vllm_configs(self) -> Dict[str, VllmConfig]:
+    def get_all_vllm_configs(self) -> Dict[str, VllmConfig]:
         """
         Get all vllm_configs for model registry building.
 
@@ -255,7 +255,7 @@ class MultiModelAsyncLLM:
                 
                 # Re-raise original exception with context
                 raise RuntimeError(
-                    f"Failed to switch model from {self._current_model_name} to {model_name}: {e}"
+                    f"Failed to switch model from {self._current_model_name} to {model_name}: {e}")
 
     
     async def _reload_model_executor(self, model_name: str) -> None:
@@ -380,4 +380,5 @@ class MultiModelAsyncLLM:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager."""
         self.shutdown()
+
 
