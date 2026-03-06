@@ -33,6 +33,44 @@ class HPUModelReloaderMixin:
     - Config updates for the new model
     """
     
+    def _clear_model_and_cache(self) -> None:
+        """Clear the current model runner and free HPU cache."""
+        if hasattr(self, 'model_runner') and self.model_runner is not None:
+            logger.info("[HPUWorker] Clearing current model from memory...")
+
+            # Explicitly delete model to free memory
+            if hasattr(self.model_runner, 'model') and self.model_runner.model is not None:
+                try:
+                    import torch
+                    for param in self.model_runner.model.parameters():
+                        param.data = torch.empty(0, device='cpu')
+                except Exception as e:
+                    logger.warning(f"[HPUWorker] Error clearing model parameters: {e}")
+
+                del self.model_runner.model
+                self.model_runner.model = None
+
+            del self.model_runner
+            self.model_runner = None
+
+        try:
+            import habana_frameworks.torch as htorch
+            if hasattr(htorch, 'hpu'):
+                htorch.hpu.empty_cache()
+                logger.info("[HPUWorker] Cleared HPU cache")
+        except Exception as e:
+            logger.warning(f"[HPUWorker] Could not clear HPU cache: {e}")
+
+    def unload_model(self) -> None:
+        """
+        Unload the current model and free resources.
+
+        This method should be called after the model has been put to sleep
+        to release HPU memory without shutting down the worker process.
+        """
+        logger.info("[HPUWorker] Unloading current model")
+        self._clear_model_and_cache()
+
     def load_model(self, vllm_config: VllmConfig) -> None:
         """
         Load a new model, replacing the current one.
@@ -57,39 +95,11 @@ class HPUModelReloaderMixin:
         """
         new_model = vllm_config.model_config.model
         logger.info(f"[HPUWorker] Reloading model: {new_model}")
-        
+
         # Step 1: Clear current model
-        if hasattr(self, 'model_runner') and self.model_runner is not None:
-            logger.info("[HPUWorker] Clearing current model from memory...")
-            
-            # Explicitly delete model to free memory
-            if hasattr(self.model_runner, 'model') and self.model_runner.model is not None:
-                # Clear model parameters
-                try:
-                    import torch
-                    for param in self.model_runner.model.parameters():
-                        param.data = torch.empty(0, device='cpu')
-                except Exception as e:
-                    logger.warning(f"[HPUWorker] Error clearing model parameters: {e}")
-                
-                # Delete the model
-                del self.model_runner.model
-                self.model_runner.model = None
-            
-            # Delete the model runner
-            del self.model_runner
-            self.model_runner = None
-        
-        # Step 2: Clear HPU cache
-        try:
-            import habana_frameworks.torch as htorch
-            if hasattr(htorch, 'hpu'):
-                htorch.hpu.empty_cache()
-                logger.info("[HPUWorker] Cleared HPU cache")
-        except Exception as e:
-            logger.warning(f"[HPUWorker] Could not clear HPU cache: {e}")
-        
-        # Step 3: Update all configs
+        self._clear_model_and_cache()
+
+        # Step 2: Update all configs
         logger.info("[HPUWorker] Updating worker configuration...")
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
@@ -156,7 +166,7 @@ def add_model_reloader_to_worker(worker_class):
     Returns:
         Enhanced worker class with model reloading capability
     """
-    if not hasattr(worker_class, 'load_model'):
+    if not hasattr(worker_class, 'load_model') or not hasattr(worker_class, 'unload_model'):
         # Create a new class that inherits from both mixin and original
         enhanced_class = type(
             worker_class.__name__,
@@ -165,3 +175,4 @@ def add_model_reloader_to_worker(worker_class):
         )
         return enhanced_class
     return worker_class
+

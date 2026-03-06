@@ -152,7 +152,47 @@ class HPUWorker(WorkerBase):
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
-    def load_model(self) -> None:
+    def _clear_model_and_cache(self) -> None:
+        """Clear model runner and free HPU cache without shutting down the worker."""
+        if hasattr(self, 'model_runner') and self.model_runner is not None:
+            if hasattr(self.model_runner, 'model') and self.model_runner.model is not None:
+                try:
+                    for param in self.model_runner.model.parameters():
+                        param.data = torch.empty(0, device='cpu')
+                except Exception as e:
+                    logger.warning(f"[HPUWorker] Error clearing model parameters: {e}")
+
+                del self.model_runner.model
+                self.model_runner.model = None
+
+            del self.model_runner
+            self.model_runner = None
+
+    def unload_model(self) -> None:
+        """Unload current model weights without shutting down the worker."""
+        logger.info("[HPUWorker] Unloading current model")
+        self._clear_model_and_cache()
+
+    def load_model(self, vllm_config: Optional[VllmConfig] = None) -> None:
+        """Load a model. If vllm_config is provided, update config and rebuild runner."""
+        if vllm_config is not None:
+            self.vllm_config = vllm_config
+            self.model_config = vllm_config.model_config
+            self.cache_config = vllm_config.cache_config
+            self.lora_config = getattr(vllm_config, 'lora_config', None)
+            self.load_config = vllm_config.load_config
+            self.parallel_config = vllm_config.parallel_config
+            self.scheduler_config = vllm_config.scheduler_config
+            self.device_config = vllm_config.device_config
+            self.speculative_config = getattr(vllm_config, 'speculative_config', None)
+            self.observability_config = getattr(vllm_config, 'observability_config', None)
+
+            self._clear_model_and_cache()
+            self.model_runner = HPUModelRunner(
+                vllm_config=self.vllm_config,
+                is_driver_worker=self.is_driver_worker,
+            )
+
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
@@ -500,3 +540,4 @@ def track_graph_compile(name: str):
     if gc.stats()[0][1] != 0:
         msg = f"[{name}] graph compilation detected: {gc.stats()}"
         logger.warning(msg)
+
