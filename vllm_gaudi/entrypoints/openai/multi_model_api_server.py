@@ -8,7 +8,7 @@ import os
 import time
 from argparse import Namespace
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Literal
+from collections.abc import AsyncIterator
 
 import uvloop
 import yaml
@@ -117,9 +117,7 @@ class MultiModelEngineClient(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self._engine.reset_encoder_cache()
 
-    async def reset_prefix_cache(
-        self, reset_running_requests: bool = False, reset_connector: bool = False
-    ) -> bool:
+    async def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
         return await self._engine.reset_prefix_cache(
             reset_running_requests=reset_running_requests,
             reset_connector=reset_connector,
@@ -156,20 +154,18 @@ class MultiModelEngineClient(EngineClient):
     async def is_paused(self) -> bool:
         return await self._engine.is_paused()
 
-    async def scale_elastic_ep(
-        self, new_data_parallel_size: int, drain_timeout: int = 300
-    ) -> None:
+    async def scale_elastic_ep(self, new_data_parallel_size: int, drain_timeout: int = 300) -> None:
         await self._engine.scale_elastic_ep(
             new_data_parallel_size=new_data_parallel_size,
             drain_timeout=drain_timeout,
         )
 
     async def collective_rpc(
-        self,
-        method: str,
-        timeout: float | None = None,
-        args: tuple = (),
-        kwargs: dict | None = None,
+            self,
+            method: str,
+            timeout: float | None = None,
+            args: tuple = (),
+            kwargs: dict | None = None,
     ):
         return await self._engine.collective_rpc(
             method=method,
@@ -223,27 +219,21 @@ class MultiModelServingModels(OpenAIServingModels):
 
         model_cards = []
         for name, base_model in self._all_model_paths.items():
-            max_model_len = self._model_max_lens.get(
-                name, self.model_config.max_model_len
-            )
+            max_model_len = self._model_max_lens.get(name, self.model_config.max_model_len)
             model_cards.append(
                 ModelCard(
                     id=name,
                     max_model_len=max_model_len,
                     root=base_model.model_path,
                     permission=[ModelPermission()],
-                )
-            )
+                ))
         lora_cards = [
             ModelCard(
                 id=lora.lora_name,
                 root=lora.path,
-                parent=lora.base_model_name
-                if lora.base_model_name
-                else self.base_model_paths[0].name,
+                parent=lora.base_model_name if lora.base_model_name else self.base_model_paths[0].name,
                 permission=[ModelPermission()],
-            )
-            for lora in self.lora_requests.values()
+            ) for lora in self.lora_requests.values()
         ]
         model_cards.extend(lora_cards)
         return ModelList(data=model_cards)
@@ -252,7 +242,6 @@ class MultiModelServingModels(OpenAIServingModels):
 class ModelSwitchRequest(BaseModel):
     model: str = Field(..., description="Target model name")
     drain_timeout: int = Field(60, ge=0)
-    sleep_level: int = Field(1, ge=0)
 
 
 class ModelSwitchResponse(BaseModel):
@@ -294,17 +283,13 @@ def _load_multi_model_config(path: str) -> tuple[dict[str, AsyncEngineArgs], str
     if default_model is None:
         default_model = next(iter(model_configs.keys()))
     if default_model not in model_configs:
-        raise ValueError(
-            f"Default model '{default_model}' not found in config models: "
-            f"{list(model_configs.keys())}"
-        )
+        raise ValueError(f"Default model '{default_model}' not found in config models: "
+                         f"{list(model_configs.keys())}")
 
     return model_configs, default_model
 
 
-def _build_model_registry(
-    manager: MultiModelAsyncLLM,
-) -> tuple[dict[str, BaseModelPath], dict[str, int]]:
+def _build_model_registry(manager: MultiModelAsyncLLM, ) -> tuple[dict[str, BaseModelPath], dict[str, int]]:
     all_model_paths: dict[str, BaseModelPath] = {}
     model_max_lens: dict[str, int] = {}
     for name, vllm_config in manager.get_all_vllm_configs().items():
@@ -322,10 +307,8 @@ async def build_multi_model_engine_client(
 ) -> AsyncIterator[tuple[MultiModelEngineClient, MultiModelAsyncLLM, dict[str, BaseModelPath], dict[str, int]]]:
     config_path = os.environ.get("VLLM_GAUDI_MULTI_MODEL_CONFIG")
     if not config_path:
-        raise ValueError(
-            "VLLM_GAUDI_MULTI_MODEL_CONFIG must be set when "
-            "VLLM_GAUDI_MULTI_MODEL=1."
-        )
+        raise ValueError("VLLM_GAUDI_MULTI_MODEL_CONFIG must be set when "
+                         "VLLM_GAUDI_MULTI_MODEL=1.")
 
     model_configs, default_model = _load_multi_model_config(config_path)
     manager = MultiModelAsyncLLM(
@@ -367,11 +350,8 @@ async def _init_multi_model_state(
     state.log_stats = not args.disable_log_stats
     state.vllm_config = engine_client.vllm_config
 
-    default_mm_loras = (
-        engine_client.vllm_config.lora_config.default_mm_loras
-        if engine_client.vllm_config.lora_config is not None
-        else {}
-    )
+    default_mm_loras = (engine_client.vllm_config.lora_config.default_mm_loras
+                        if engine_client.vllm_config.lora_config is not None else {})
     lora_modules = process_lora_modules(args.lora_modules, default_mm_loras)
     state.openai_serving_models = MultiModelServingModels(
         engine_client=engine_client,
@@ -397,18 +377,13 @@ async def _init_multi_model_state(
     if "generate" in supported_tasks:
         from vllm.entrypoints.openai.generate.api_router import init_generate_state
 
-        await init_generate_state(
-            engine_client, state, args, request_logger, supported_tasks
-        )
+        await init_generate_state(engine_client, state, args, request_logger, supported_tasks)
 
     if "transcription" in supported_tasks:
         from vllm.entrypoints.openai.speech_to_text.api_router import (
-            init_transcription_state,
-        )
+            init_transcription_state, )
 
-        init_transcription_state(
-            engine_client, state, args, request_logger, supported_tasks
-        )
+        init_transcription_state(engine_client, state, args, request_logger, supported_tasks)
 
     if "realtime" in supported_tasks:
         from vllm.entrypoints.openai.realtime.api_router import init_realtime_state
@@ -444,7 +419,6 @@ def _attach_multi_model_router(app: FastAPI) -> None:
         await manager.switch_model(
             request.model,
             drain_timeout=request.drain_timeout,
-            sleep_level=request.sleep_level,
         )
         await _init_multi_model_state(
             engine_client,
@@ -484,10 +458,10 @@ async def _run_multi_model_server_worker(
         uvicorn_kwargs["log_config"] = log_config
 
     async with build_multi_model_engine_client(args) as (
-        engine_client,
-        manager,
-        all_model_paths,
-        model_max_lens,
+            engine_client,
+            manager,
+            all_model_paths,
+            model_max_lens,
     ):
         supported_tasks = await engine_client.get_supported_tasks()
         logger.info("Supported tasks: %s", supported_tasks)
@@ -549,9 +523,8 @@ def _should_use_multi_model() -> bool:
 
 if __name__ == "__main__":
     cli_env_setup()
-    parser = make_arg_parser(FlexibleArgumentParser(
-        description="vLLM OpenAI-Compatible RESTful API server (Gaudi multi-model)."
-    ))
+    parser = make_arg_parser(
+        FlexibleArgumentParser(description="vLLM OpenAI-Compatible RESTful API server (Gaudi multi-model)."))
     args = parser.parse_args()
     validate_parsed_serve_args(args)
 

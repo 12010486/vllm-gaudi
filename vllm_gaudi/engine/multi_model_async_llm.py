@@ -10,6 +10,7 @@ from typing import Optional
 from collections.abc import AsyncGenerator
 import asyncio
 import cloudpickle
+import time
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.usage.usage_lib import UsageContext
@@ -175,7 +176,6 @@ class MultiModelAsyncLLM:
         Args:
             model_name: Target model name
             drain_timeout: Seconds to wait for requests to drain
-            sleep_level: Sleep level (1 = CPU offload)
         
         Raises:
             ValueError: If model not found
@@ -193,22 +193,6 @@ class MultiModelAsyncLLM:
                 logger.info(f"Model '{model_name}' already loaded.")
                 return
 
-            current_config = self._vllm_configs[self._current_model_name]
-            target_config = self._vllm_configs[model_name]
-            current_model_cfg = current_config.model_config
-            target_model_cfg = target_config.model_config
-
-            # Single-engine AsyncLLM hot-swap is only safe when scheduler/
-            # tokenizer-sensitive runtime shape is effectively unchanged.
-            incompatible = (current_model_cfg.model != target_model_cfg.model
-                            or current_model_cfg.tokenizer != target_model_cfg.tokenizer
-                            or current_model_cfg.max_model_len != target_model_cfg.max_model_len)
-            if incompatible:
-                raise RuntimeError("Single-engine hot-swap across different model/tokenizer "
-                                   "configurations is not supported for AsyncLLM. "
-                                   "Use engine reinitialization (shutdown + initialize) or "
-                                   "switch to LLM with VLLM_ENABLE_V1_MULTIPROCESSING=0.")
-
             old_model = self._vllm_configs[self._current_model_name].model_config.model
             new_model = self._vllm_configs[model_name].model_config.model
 
@@ -225,24 +209,27 @@ class MultiModelAsyncLLM:
                 except asyncio.TimeoutError:
                     logger.warning(f"Drain timeout ({drain_timeout}s) exceeded. Proceeding with caution.")
 
-                # Step 2: Sleep current model (free memory)
-                logger.info(f"Sleeping model: {self._current_model_name}")
-                await self._engine.sleep(level=1)
+                # Step 2: Reconfigure engine core and scheduler in-process
+                logger.info(
+                    "[gaudi_reconfigure] caller start: from=%s to=%s",
+                    self._current_model_name,
+                    model_name,
+                )
+                logger.info(f"Reconfiguring engine for: {model_name}")
+                serialized_config = cloudpickle.dumps(self._vllm_configs[model_name])
+                reconfigure_start = time.perf_counter()
+                await self._engine.engine_core.call_utility_async(
+                    "gaudi_reconfigure_engine",
+                    serialized_config,
+                )
+                logger.info(
+                    "[gaudi_reconfigure] caller complete: to=%s elapsed=%.2fs",
+                    model_name,
+                    time.perf_counter() - reconfigure_start,
+                )
                 self._sleeping[self._current_model_name] = True
-                logger.info(f"Model sleep state: {self._current_model_name}=sleeping")
-
-                # Step 3: Unload current model weights
-                logger.info(f"Unloading model: {self._current_model_name}")
-                await self._unload_model_executor()
-
-                # Step 4: Reload new model on same engine
-                logger.info(f"Reloading executor for: {model_name}")
-                await self._reload_model_executor(model_name)
-
-                # Step 5: Reinitialize KV cache for new model
-                logger.info("Reinitializing KV cache after model reload")
-                await self._engine.wake_up(tags=["kv_cache"])
                 self._sleeping[model_name] = False
+                logger.info(f"Model sleep state: {self._current_model_name}=sleeping")
                 logger.info(f"Model sleep state: {model_name}=awake")
 
                 self._current_model_name = model_name
@@ -266,33 +253,6 @@ class MultiModelAsyncLLM:
 
                 # Re-raise original exception with context
                 raise RuntimeError(f"Failed to switch model from {self._current_model_name} to {model_name}: {e}")
-
-    async def _reload_model_executor(self, model_name: str) -> None:
-        """Reload model executor with new config via collective RPC."""
-        new_config = self._vllm_configs[model_name]
-        serialized_config = cloudpickle.dumps(new_config)
-
-        try:
-            await self._engine.collective_rpc(
-                method="load_model",
-                kwargs={"vllm_config_bytes": serialized_config},
-                timeout=300.0,
-            )
-        except Exception as e:
-            logger.error(f"Failed to reload model: {e}")
-            raise RuntimeError(f"Model reload failed: {e}") from e
-
-    async def _unload_model_executor(self) -> None:
-        """Unload current model weights via collective RPC."""
-        try:
-            await self._engine.collective_rpc(
-                method="unload_model",
-                kwargs={},
-                timeout=120.0,
-            )
-        except Exception as e:
-            logger.error(f"Failed to unload model: {e}")
-            raise RuntimeError(f"Model unload failed: {e}") from e
 
     async def generate(
         self,

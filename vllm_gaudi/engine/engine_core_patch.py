@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Gaudi-only patch to add an in-process engine reconfigure path."""
+
+from __future__ import annotations
+
+from collections import deque
+import queue
+import time
+from typing import Any
+
+import cloudpickle
+
+from vllm.logger import init_logger
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.structured_output import StructuredOutputManager
+
+logger = init_logger(__name__)
+
+
+def install_engine_core_patch() -> None:
+    """Install a Gaudi-only EngineCore reconfigure hook."""
+    from vllm.v1.engine.core import EngineCore
+
+    if hasattr(EngineCore, "gaudi_reconfigure_engine"):
+        return
+
+    def gaudi_reconfigure_engine(self: Any, vllm_config_bytes: bytes) -> None:
+        """Reconfigure EngineCore for a new model/config in-process.
+
+        This rebuilds KV cache configs, scheduler, and related runtime state
+        after reloading model weights on workers.
+        """
+        start = time.perf_counter()
+        new_config = cloudpickle.loads(vllm_config_bytes)
+        logger.info("[gaudi_reconfigure] start: target_model=%s", new_config.model_config.model)
+
+        # Pause scheduling and clear caches to avoid mixed state.
+        try:
+            self.pause_scheduler(mode="abort", clear_cache=True)
+            logger.info("[gaudi_reconfigure] scheduler paused and caches reset")
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("Failed to pause scheduler before reconfigure: %s", exc)
+
+        # Sleep to release device memory before reloading weights.
+        try:
+            self.model_executor.sleep(level=1)
+            logger.info("[gaudi_reconfigure] executor slept (level=1)")
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("Failed to sleep executor before reconfigure: %s", exc)
+
+        # Reload model weights/config on workers.
+        self.collective_rpc("load_model", kwargs={"vllm_config_bytes": vllm_config_bytes})
+        logger.info("[gaudi_reconfigure] worker model reload complete")
+
+        # Update config and reinitialize KV caches.
+        self.vllm_config = new_config
+        self.available_gpu_memory_for_kv_cache = -1
+        num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(new_config)
+        new_config.cache_config.num_gpu_blocks = num_gpu_blocks
+        new_config.cache_config.num_cpu_blocks = num_cpu_blocks
+        self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
+        logger.info(
+            "[gaudi_reconfigure] kv cache reinitialized: num_gpu_blocks=%d num_cpu_blocks=%d",
+            num_gpu_blocks,
+            num_cpu_blocks,
+        )
+
+        # Rebuild structured output manager.
+        self.structured_output_manager = StructuredOutputManager(new_config)
+        logger.info("[gaudi_reconfigure] structured output manager rebuilt")
+
+        # Rebuild scheduler.
+        Scheduler = new_config.scheduler_config.get_scheduler_cls()
+        if len(kv_cache_config.kv_cache_groups) == 0 and new_config.scheduler_config.enable_chunked_prefill:
+            logger.warning("Disabling chunked prefill for model without KVCache")
+            new_config.scheduler_config.enable_chunked_prefill = False
+
+        scheduler_block_size = (new_config.cache_config.block_size *
+                                new_config.parallel_config.decode_context_parallel_size *
+                                new_config.parallel_config.prefill_context_parallel_size)
+
+        self.scheduler = Scheduler(
+            vllm_config=new_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=self.structured_output_manager,
+            include_finished_set=False,
+            log_stats=self.log_stats,
+            block_size=scheduler_block_size,
+        )
+        logger.info("[gaudi_reconfigure] scheduler rebuilt")
+
+        self.use_spec_decode = new_config.speculative_config is not None
+        if self.scheduler.connector is not None:  # type: ignore[has-type]
+            self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore[arg-type]
+            logger.info("[gaudi_reconfigure] kv output aggregator initialized")
+
+        # Rebuild multimodal receiver cache.
+        self.mm_registry = mm_registry = MULTIMODAL_REGISTRY
+        self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(new_config)
+        logger.info("[gaudi_reconfigure] multimodal receiver cache rebuilt")
+
+        kv_connector = self.scheduler.get_kv_connector()
+        if kv_connector is not None:
+            xfer_handshake_metadata = self.model_executor.get_kv_connector_handshake_metadata()
+            if xfer_handshake_metadata:
+                content: dict[int, Any] = {}
+                for worker_dict in xfer_handshake_metadata:
+                    if worker_dict is not None:
+                        content.update(worker_dict)
+                kv_connector.set_xfer_handshake_metadata(content)
+                logger.info("[gaudi_reconfigure] kv connector handshake metadata refreshed")
+
+        # Rebuild batch queue and scheduling helpers.
+        self.batch_queue_size = self.model_executor.max_concurrent_batches
+        self.batch_queue = deque(maxlen=self.batch_queue_size) if self.batch_queue_size > 1 else None
+
+        self.is_ec_producer = (new_config.ec_transfer_config is not None
+                               and new_config.ec_transfer_config.is_ec_producer)
+        self.is_pooling_model = new_config.model_config.runner_type == "pooling"
+
+        self.request_block_hasher = None
+        if new_config.cache_config.enable_prefix_caching or kv_connector is not None:
+            caching_hash_fn = get_hash_fn_by_name(new_config.cache_config.prefix_caching_hash_algo)
+            init_none_hash(caching_hash_fn)
+            self.request_block_hasher = get_request_block_hasher(scheduler_block_size, caching_hash_fn)
+
+        self.step_fn = self.step if self.batch_queue is None else self.step_with_batch_queue
+        self.async_scheduling = new_config.scheduler_config.async_scheduling
+        self.aborts_queue = queue.Queue()
+        logger.info("[gaudi_reconfigure] execution state rebuilt")
+
+        # Resume scheduler after reconfigure.
+        self.resume_scheduler()
+        elapsed = time.perf_counter() - start
+        logger.info("[gaudi_reconfigure] completed in %.2fs", elapsed)
+
+    EngineCore.gaudi_reconfigure_engine = gaudi_reconfigure_engine
