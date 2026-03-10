@@ -34,6 +34,8 @@ nav:
     - features/floating_point_8.md
     - features/warmup.md
     - features/row_parallel_chunking.md
+  - Design:
+    - design/single_process_model_swap_arch_overview.md
   - Developer Guides:
     - dev_guide/plugin_system.md
     - dev_guide/ci-failures.md

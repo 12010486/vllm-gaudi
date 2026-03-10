@@ -75,6 +75,49 @@ To enable the feature:
    "dynamicquantization": "True",
    "scaleformat": "CONST"
    ```
+### Single Process model swap
+
+This feature allows a hot swap of models within AsyncLLM(), without restarting the Engine nor killing the process. The in-process model swap is needed when multiple small models want to sequentially share the same HPU card. It is building on top of sleep model Level 1.
+
+To enable the feature:
+
+1. Create a `yaml` file with models' config. For example:
+ ```
+default_model: llama
+models:
+    llama:
+        model: meta-llama/Llama-3.1-8B-Instruct
+        max_model_len: 4096
+        tensor_parallel_size: 1
+    qwen:
+        model: Qwen/Qwen3-0.6B
+        max_model_len: 4096
+        tensor_parallel_size: 1
+ ```
+2. Add as environment variables:
+ ```
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_HPU_MULTI_MODEL=1
+export VLLM_HPU_MULTI_MODEL_CONFIG=/path/to/multi_models.yaml
+ ```
+3. Launch the server from the new OpenAI compatible API as:
+```
+python -m vllm_gaudi.entrypoints.openai.multi_model_api_server \
+  --port 8080
+```
+4. Test the new functionality with:
+```bash
+curl http://localhost:8080/v1/models | jq
+```
+or
+```bash
+url http://localhost:8080/v1/models/switch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen",
+    "drain_timeout": 60
+  }' | jq
+```
 
 ## Planned Features
 
