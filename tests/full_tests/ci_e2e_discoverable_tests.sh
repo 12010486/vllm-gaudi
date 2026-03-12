@@ -455,6 +455,153 @@ run_sleep_mode_test() {
     echo "✅ Test with sleep mode passed."
 }
 
+# single-process model swap online e2e
+# Flow: start -> list models -> generation model1 -> switch -> generation model2 -> completion
+run_single_process_model_swap_online_e2e_test() {
+    echo "➡️ Testing single-process model swap online flow..."
+
+    local MODEL_A=${MODEL_A:-"meta-llama/Llama-3.1-8B-Instruct"}
+    local MODEL_B=${MODEL_B:-"Qwen/Qwen3-0.6B"}
+    local PORT=${MODEL_SWAP_PORT:-8088}
+    local CONFIG_FILE
+    local SERVER_LOG
+    CONFIG_FILE=$(mktemp /tmp/vllm-gaudi-multi-model-XXXXXX.yaml)
+    SERVER_LOG=$(mktemp /tmp/vllm-gaudi-multi-model-server-XXXXXX.log)
+
+    cat > "$CONFIG_FILE" <<EOF
+default_model: model_a
+models:
+  model_a:
+    model: ${MODEL_A}
+    tensor_parallel_size: 1
+    max_model_len: 4096
+  model_b:
+    model: ${MODEL_B}
+    tensor_parallel_size: 1
+    max_model_len: 4096
+EOF
+
+    cleanup() {
+        if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+            kill "$SERVER_PID" >/dev/null 2>&1 || true
+            wait "$SERVER_PID" >/dev/null 2>&1 || true
+        fi
+        rm -f "$CONFIG_FILE" "$SERVER_LOG"
+    }
+    trap cleanup EXIT
+
+    echo "   [1/6] start server"
+    HABANA_VISIBLE_DEVICES=all \
+    VLLM_SKIP_WARMUP=true \
+    PT_HPU_LAZY_MODE=0 \
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    VLLM_GAUDI_MULTI_MODEL=1 \
+    VLLM_GAUDI_MULTI_MODEL_CONFIG="$CONFIG_FILE" \
+    python -u -m vllm_gaudi.entrypoints.openai.multi_model_api_server \
+      --model "$MODEL_A" \
+      --host 127.0.0.1 \
+      --port "$PORT" > "$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+
+    local READY=0
+    for _ in $(seq 1 120); do
+        if curl -fsS "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; then
+            READY=1
+            break
+        fi
+        sleep 1
+    done
+
+    if [[ "$READY" -ne 1 ]]; then
+        echo "❌ Server did not become ready in time. Last logs:"
+        tail -n 100 "$SERVER_LOG" || true
+        exit 1
+    fi
+
+    echo "   [2/6] list models"
+    python - <<PY
+import json
+import urllib.request
+
+port = ${PORT}
+with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=30) as resp:
+    payload = json.loads(resp.read().decode("utf-8"))
+ids = [m["id"] for m in payload.get("data", [])]
+assert "model_a" in ids, f"model_a missing, got: {ids}"
+assert "model_b" in ids, f"model_b missing, got: {ids}"
+print("models:", ids)
+PY
+
+    echo "   [3/6] generation with model_a"
+    python - <<PY
+import json
+import urllib.request
+
+port = ${PORT}
+body = {
+    "model": "model_a",
+    "prompt": "Say hello from model A in 6 words.",
+    "max_tokens": 16,
+    "temperature": 0,
+}
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/v1/completions",
+    data=json.dumps(body).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(req, timeout=120) as resp:
+    payload = json.loads(resp.read().decode("utf-8"))
+text = payload["choices"][0]["text"]
+assert text.strip(), "empty completion for model_a"
+print("model_a completion:", text.strip())
+PY
+
+    echo "   [4/6] switch to model_b"
+    python - <<PY
+import json
+import urllib.request
+
+port = ${PORT}
+body = {"model": "model_b", "drain_timeout": 60}
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/v1/models/switch",
+    data=json.dumps(body).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(req, timeout=300) as resp:
+    payload = json.loads(resp.read().decode("utf-8"))
+assert payload.get("current_model") == "model_b", payload
+print("switch response:", payload)
+PY
+
+    echo "   [5/6] generation with model_b"
+    python - <<PY
+import json
+import urllib.request
+
+port = ${PORT}
+body = {
+    "model": "model_b",
+    "prompt": "Say hello from model B in 6 words.",
+    "max_tokens": 16,
+    "temperature": 0,
+}
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/v1/completions",
+    data=json.dumps(body).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(req, timeout=120) as resp:
+    payload = json.loads(resp.read().decode("utf-8"))
+text = payload["choices"][0]["text"]
+assert text.strip(), "empty completion for model_b"
+print("model_b completion:", text.strip())
+PY
+
+    echo "   [6/6] completion"
+    echo "✅ Single-process model swap online e2e flow passed."
+}
+
 # Structured output
 run_structured_output_test() {
     echo "➡️ Testing structured output..."

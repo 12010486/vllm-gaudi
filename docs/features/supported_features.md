@@ -97,21 +97,24 @@ models:
 2. Add as environment variables:
  ```
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
-export VLLM_HPU_MULTI_MODEL=1
-export VLLM_HPU_MULTI_MODEL_CONFIG=/path/to/multi_models.yaml
+export VLLM_GAUDI_MULTI_MODEL=1
+export VLLM_GAUDI_MULTI_MODEL_CONFIG=/path/to/multi_models.yaml
  ```
+   Compatibility aliases also supported: `VLLM_HPU_MULTI_MODEL` and `VLLM_HPU_MULTI_MODEL_CONFIG`.
 3. Launch the server from the new OpenAI compatible API as:
 ```
 python -m vllm_gaudi.entrypoints.openai.multi_model_api_server \
   --port 8080
 ```
+See full online walkthrough in [Single-Process Model Swap (Online Quickstart)](../getting_started/quickstart/quickstart_single_process_model_swap_online.md).
+
 4. Test the new functionality with:
 ```bash
 curl http://localhost:8080/v1/models | jq
 ```
 or
 ```bash
-url http://localhost:8080/v1/models/switch \
+curl http://localhost:8080/v1/models/switch \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen",

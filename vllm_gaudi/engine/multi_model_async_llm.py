@@ -193,7 +193,6 @@ class MultiModelAsyncLLM:
                 logger.info(f"Model '{model_name}' already loaded.")
                 return
 
-            old_model = self._vllm_configs[self._current_model_name].model_config.model
             new_model = self._vllm_configs[model_name].model_config.model
 
             logger.info(f"Switching from {self._current_model_name} to {model_name}")
@@ -252,7 +251,7 @@ class MultiModelAsyncLLM:
                                  f"Engine may be unresponsive. Manual server restart required.")
 
                 # Re-raise original exception with context
-                raise RuntimeError(f"Failed to switch model from {self._current_model_name} to {model_name}: {e}")
+                raise RuntimeError(f"Failed to switch model from {self._current_model_name} to {model_name}: {e}") from e
 
     async def generate(
         self,

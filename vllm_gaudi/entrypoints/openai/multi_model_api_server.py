@@ -257,6 +257,11 @@ def _env_truthy(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_multi_model_config_path() -> str | None:
+    return (os.environ.get("VLLM_GAUDI_MULTI_MODEL_CONFIG")
+            or os.environ.get("VLLM_HPU_MULTI_MODEL_CONFIG"))
+
+
 def _load_multi_model_config(path: str) -> tuple[dict[str, AsyncEngineArgs], str]:
     with open(path) as f:
         data = yaml.safe_load(f)
@@ -305,10 +310,11 @@ async def build_multi_model_engine_client(
     *,
     usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,
 ) -> AsyncIterator[tuple[MultiModelEngineClient, MultiModelAsyncLLM, dict[str, BaseModelPath], dict[str, int]]]:
-    config_path = os.environ.get("VLLM_GAUDI_MULTI_MODEL_CONFIG")
+    config_path = _resolve_multi_model_config_path()
     if not config_path:
-        raise ValueError("VLLM_GAUDI_MULTI_MODEL_CONFIG must be set when "
-                         "VLLM_GAUDI_MULTI_MODEL=1.")
+        raise ValueError("A multi-model config path must be set when multi-model mode is enabled. "
+                         "Supported env vars: VLLM_GAUDI_MULTI_MODEL_CONFIG, "
+                         "VLLM_HPU_MULTI_MODEL_CONFIG.")
 
     model_configs, default_model = _load_multi_model_config(config_path)
     manager = MultiModelAsyncLLM(
@@ -472,6 +478,7 @@ async def _run_multi_model_server_worker(
         app.state.multi_model_all_model_paths = all_model_paths
         app.state.multi_model_max_lens = model_max_lens
         app.state.supported_tasks = supported_tasks
+        app.state.args = args
 
         await _init_multi_model_state(
             engine_client,
@@ -518,7 +525,8 @@ async def _run_multi_model_server(args: Namespace) -> None:
 
 
 def _should_use_multi_model() -> bool:
-    return _env_truthy(os.environ.get("VLLM_GAUDI_MULTI_MODEL"))
+    return (_env_truthy(os.environ.get("VLLM_GAUDI_MULTI_MODEL"))
+            or _env_truthy(os.environ.get("VLLM_HPU_MULTI_MODEL")))
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ nav:
       - getting_started/quickstart/quickstart.md
       - getting_started/quickstart/quickstart_configuration.md
       - getting_started/quickstart/quickstart_inference.md
+      - getting_started/quickstart/quickstart_single_process_model_swap_online.md
     - getting_started/installation.md
     - release_notes.md
     - getting_started/compatibility_matrix.md

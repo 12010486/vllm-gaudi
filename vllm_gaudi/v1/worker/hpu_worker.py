@@ -173,6 +173,9 @@ class HPUWorker(WorkerBase):
             del self.model_runner
             self.model_runner = None
 
+        gc.collect()
+        htorch.hpu.empty_cache()
+
     def unload_model(self) -> None:
         """Unload current model weights without shutting down the worker."""
         logger.info("[HPUWorker] Unloading current model")
@@ -196,10 +199,16 @@ class HPUWorker(WorkerBase):
             self.lora_config = getattr(vllm_config, 'lora_config', None)
             self.load_config = vllm_config.load_config
             self.parallel_config = vllm_config.parallel_config
+            self.parallel_config.rank = self.rank
             self.scheduler_config = vllm_config.scheduler_config
             self.device_config = vllm_config.device_config
             self.speculative_config = getattr(vllm_config, 'speculative_config', None)
             self.observability_config = getattr(vllm_config, 'observability_config', None)
+
+            if self.cache_config.cache_dtype == "auto":
+                self.cache_dtype = self.model_config.dtype
+            else:
+                self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[self.cache_config.cache_dtype]
 
             self._clear_model_and_cache()
             with set_current_vllm_config(self.vllm_config):
@@ -403,7 +412,7 @@ class HPUWorker(WorkerBase):
             kv_cache_groups=kv_cache_groups,
         )
 
-    def compile_or_warm_up_model(self)-> float:
+    def compile_or_warm_up_model(self) -> float:
         # Don't run the warmup if the model is already warmed up
         if not getattr(self.model_runner, 'graphed_buckets', None):
             self.model_runner.warmup_model()

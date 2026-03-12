@@ -64,3 +64,35 @@ Rebuilt state includes:
 - multimodal receiver cache
 - request block hashing setup
 - queueing/execution helper state (`batch_queue`, `step_fn`, abort queue)
+
+## Maintainability Guardrails
+
+To keep this feature maintainable over time:
+
+1. **Single owner contract**
+   - Keep swap orchestration logic centralized in `MultiModelAsyncLLM`.
+   - Avoid duplicating switch flow in entrypoints or worker code.
+
+2. **Patch boundary discipline**
+   - Keep `EngineCore` patch minimal and Gaudi-scoped.
+   - If upstream internals change, update only the patch adapter layer first.
+
+3. **Config compatibility policy**
+   - Prefer swaps between models with aligned runtime assumptions (parallelism, cache behavior, scheduling expectations).
+   - Validate heterogeneous model pairs with explicit smoke cycles.
+
+4. **Test matrix (minimum)**
+   - init -> generate -> switch -> generate
+   - no-op switch
+   - invalid model switch
+   - repeated switch cycles (stability)
+
+5. **Operational rollback**
+   - Keep feature fully toggleable via env flags.
+   - Preserve standard `vllm serve` path as immediate fallback.
+
+## Recommended Pre-PR Evidence
+
+- Include one online smoke transcript (models list, completion, switch, completion).
+- Include swap latency summary over multiple cycles.
+- Include memory trend snapshot before/after repeated swaps.
