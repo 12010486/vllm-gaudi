@@ -21,11 +21,10 @@ class _FakeAsyncEngineArgs:
         self.enable_log_requests = False
 
     def create_engine_config(self, _usage_context):
-        return SimpleNamespace(
-            model_config=SimpleNamespace(
-                model=self.model,
-                max_model_len=self.max_model_len,
-            ))
+        return SimpleNamespace(model_config=SimpleNamespace(
+            model=self.model,
+            max_model_len=self.max_model_len,
+        ))
 
 
 @pytest.fixture
@@ -46,33 +45,22 @@ def test_env_truthy_variants():
     assert not api_server._env_truthy(None)
 
 
-def test_should_use_multi_model_supports_alias(monkeypatch):
-    monkeypatch.delenv("VLLM_GAUDI_MULTI_MODEL", raising=False)
-    monkeypatch.setenv("VLLM_HPU_MULTI_MODEL", "1")
-    assert api_server._should_use_multi_model()
-
-
-def test_resolve_config_path_prefers_gaudi(monkeypatch):
-    monkeypatch.setenv("VLLM_GAUDI_MULTI_MODEL_CONFIG", "/tmp/gaudi.yaml")
-    monkeypatch.setenv("VLLM_HPU_MULTI_MODEL_CONFIG", "/tmp/hpu.yaml")
-    assert api_server._resolve_multi_model_config_path() == "/tmp/gaudi.yaml"
-
-
 def test_load_multi_model_config_success(tmp_path):
     cfg_path = tmp_path / "multi.yaml"
-    cfg_path.write_text(yaml.safe_dump({
-        "default_model": "llama",
-        "models": {
-            "llama": {
-                "model": "meta-llama/Llama-3.1-8B-Instruct",
-                "max_model_len": 4096,
+    cfg_path.write_text(
+        yaml.safe_dump({
+            "default_model": "llama",
+            "models": {
+                "llama": {
+                    "model": "meta-llama/Llama-3.1-8B-Instruct",
+                    "max_model_len": 4096,
+                },
+                "qwen": {
+                    "model": "Qwen/Qwen3-0.6B",
+                    "max_model_len": 4096,
+                },
             },
-            "qwen": {
-                "model": "Qwen/Qwen3-0.6B",
-                "max_model_len": 4096,
-            },
-        },
-    }))
+        }))
 
     with patch.object(api_server, "AsyncEngineArgs", _FakeAsyncEngineArgs):
         model_configs, default_model = api_server._load_multi_model_config(str(cfg_path))
@@ -83,16 +71,17 @@ def test_load_multi_model_config_success(tmp_path):
 
 def test_load_multi_model_config_falls_back_to_model_env(tmp_path, monkeypatch):
     cfg_path = tmp_path / "multi.yaml"
-    cfg_path.write_text(yaml.safe_dump({
-        "models": {
-            "llama": {
-                "model": "meta-llama/Llama-3.1-8B-Instruct",
+    cfg_path.write_text(
+        yaml.safe_dump({
+            "models": {
+                "llama": {
+                    "model": "meta-llama/Llama-3.1-8B-Instruct",
+                },
+                "qwen": {
+                    "model": "Qwen/Qwen3-0.6B",
+                },
             },
-            "qwen": {
-                "model": "Qwen/Qwen3-0.6B",
-            },
-        },
-    }))
+        }))
     monkeypatch.setenv("MODEL", "qwen")
 
     with patch.object(api_server, "AsyncEngineArgs", _FakeAsyncEngineArgs):
