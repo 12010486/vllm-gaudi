@@ -86,13 +86,6 @@ curl -s http://localhost:8080/v1/chat/completions \
   }' | jq
 ```
 
-## CI-friendly one-command flow
-
-```bash
-cd /path/to/vllm-gaudi
-bash tests/full_tests/ci_e2e_discoverable_tests.sh run_single_process_model_swap_online_e2e_test
-```
-
 ## Rollback
 
 To disable this mode, unset multi-model env flag and use standard serving:
