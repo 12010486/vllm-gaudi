@@ -58,14 +58,11 @@ def install_engine_core_patch() -> None:
         # Update config and reinitialize KV caches.
         self.vllm_config = new_config
         self.available_gpu_memory_for_kv_cache = -1
-        num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(new_config)
-        new_config.cache_config.num_gpu_blocks = num_gpu_blocks
-        new_config.cache_config.num_cpu_blocks = num_cpu_blocks
-        self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
+        kv_cache_config = self._initialize_kv_caches(new_config)
+        num_gpu_blocks = new_config.cache_config.num_gpu_blocks
         logger.info(
-            "[gaudi_reconfigure] kv cache reinitialized: num_gpu_blocks=%d num_cpu_blocks=%d",
+            "[gaudi_reconfigure] kv cache reinitialized: num_gpu_blocks=%d",
             num_gpu_blocks,
-            num_cpu_blocks,
         )
 
         # Rebuild structured output manager.
@@ -117,8 +114,7 @@ def install_engine_core_patch() -> None:
         self.batch_queue_size = self.model_executor.max_concurrent_batches
         self.batch_queue = deque(maxlen=self.batch_queue_size) if self.batch_queue_size > 1 else None
 
-        self.is_ec_producer = (new_config.ec_transfer_config is not None
-                               and new_config.ec_transfer_config.is_ec_producer)
+        self.is_ec_consumer = (new_config.ec_transfer_config is None or new_config.ec_transfer_config.is_ec_consumer)
         self.is_pooling_model = new_config.model_config.runner_type == "pooling"
 
         self.request_block_hasher = None
