@@ -165,8 +165,7 @@ class HPUWorker(WorkerBase):
                     for param in self.model_runner.model.parameters():
                         param.data = torch.empty(0, device='cpu')
                 except Exception as e:
-                    logger.warning(f"[HPUWorker] Error clearing model parameters: {e}")
-
+                    logger.warning("[HPUWorker] Error clearing model parameters: %s", e)
                 del self.model_runner.model
                 self.model_runner.model = None
 
@@ -174,7 +173,6 @@ class HPUWorker(WorkerBase):
             self.model_runner = None
 
         gc.collect()
-        htorch.hpu.empty_cache()
 
     def unload_model(self) -> None:
         """Unload current model weights without shutting down the worker."""

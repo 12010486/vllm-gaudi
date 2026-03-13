@@ -258,8 +258,7 @@ def _env_truthy(value: str | None) -> bool:
 
 
 def _resolve_multi_model_config_path() -> str | None:
-    return (os.environ.get("VLLM_GAUDI_MULTI_MODEL_CONFIG")
-            or os.environ.get("VLLM_HPU_MULTI_MODEL_CONFIG"))
+    return (os.environ.get("VLLM_GAUDI_MULTI_MODEL_CONFIG") or os.environ.get("VLLM_HPU_MULTI_MODEL_CONFIG"))
 
 
 def _load_multi_model_config(path: str) -> tuple[dict[str, AsyncEngineArgs], str]:
@@ -346,10 +345,7 @@ async def _init_multi_model_state(
     model_max_lens: dict[str, int],
     active_model_name: str,
 ) -> None:
-    if args.enable_log_requests:
-        request_logger = RequestLogger(max_log_len=args.max_log_len)
-    else:
-        request_logger = None
+    request_logger = RequestLogger(max_log_len=args.max_log_len) if args.enable_log_requests else None
 
     state.request_logger = request_logger
     state.engine_client = engine_client
@@ -376,9 +372,7 @@ async def _init_multi_model_state(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-        trust_request_chat_template=args.trust_request_chat_template,
-        log_error_stack=args.log_error_stack,
-    )
+        trust_request_chat_template=args.trust_request_chat_template)
 
     if "generate" in supported_tasks:
         from vllm.entrypoints.openai.generate.api_router import init_generate_state
@@ -406,6 +400,11 @@ async def _init_multi_model_state(
 
 
 def _attach_multi_model_router(app: FastAPI) -> None:
+    if not envs.VLLM_SERVER_DEV_MODE:
+        logger.warning("The /v1/models/switch endpoint is disabled. "
+                       "Set VLLM_SERVER_DEV_MODE=1 to enable it.")
+        return
+
     router = APIRouter()
 
     @router.post("/v1/models/switch", response_model=ModelSwitchResponse)
