@@ -157,8 +157,8 @@ class HPUWorker(WorkerBase):
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
-    def _clear_model_and_cache(self) -> None:
-        """Clear model runner and free HPU cache without shutting down the worker."""
+    def _clear_model(self) -> None:
+        """Clear model runner and without shutting down the worker."""
         if hasattr(self, 'model_runner') and self.model_runner is not None:
             if hasattr(self.model_runner, 'model') and self.model_runner.model is not None:
                 try:
@@ -177,7 +177,7 @@ class HPUWorker(WorkerBase):
     def unload_model(self) -> None:
         """Unload current model weights without shutting down the worker."""
         logger.info("[HPUWorker] Unloading current model")
-        self._clear_model_and_cache()
+        self._clear_model()
 
     def load_model(
         self,
@@ -188,8 +188,6 @@ class HPUWorker(WorkerBase):
         if vllm_config_bytes is not None:
             import cloudpickle
             vllm_config = cloudpickle.loads(vllm_config_bytes)
-        elif isinstance(vllm_config, dict):
-            vllm_config = VllmConfig(**vllm_config)
         if vllm_config is not None:
             self.vllm_config = vllm_config
             self.model_config = vllm_config.model_config
@@ -208,7 +206,7 @@ class HPUWorker(WorkerBase):
             else:
                 self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[self.cache_config.cache_dtype]
 
-            self._clear_model_and_cache()
+            self._clear_model()
             with set_current_vllm_config(self.vllm_config):
                 self.model_runner = HPUModelRunner(
                     vllm_config=self.vllm_config,

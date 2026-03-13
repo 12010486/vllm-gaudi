@@ -6,7 +6,6 @@ This quickstart shows an end-to-end online flow for serving multiple small model
 
 Use this mode when:
 
-- You run one process per HPU card.
 - You need to switch model A → model B without server restart.
 - Your workload is sequential and model sizes fit the card budget.
 
@@ -34,18 +33,13 @@ models:
 
 ```bash
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
-export VLLM_GAUDI_MULTI_MODEL=1
-export VLLM_GAUDI_MULTI_MODEL_CONFIG=/path/to/multi_models.yaml
+export VLLM_SERVER_DEV_MODE=1
+export VLLM_HPU_MULTI_MODEL_CONFIG=/path/to/multi_models.yaml
 
 python -m vllm_gaudi.entrypoints.openai.multi_model_api_server \
   --host 0.0.0.0 \
   --port 8080
 ```
-
-Compatibility aliases are also supported:
-
-- `VLLM_HPU_MULTI_MODEL`
-- `VLLM_HPU_MULTI_MODEL_CONFIG`
 
 ## Online Flow (Smoke Test)
 
@@ -55,20 +49,20 @@ Compatibility aliases are also supported:
 curl -s http://localhost:8080/v1/models | jq
 ```
 
-2) Generate with default model:
+1) Generate with default model:
 
 ```bash
 curl -s http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama",
-    "messages": [{"role": "user", "content": "Explain Gaudi in one sentence."}],
+    "messages": [{"role": "user", "content": "Explain Intel Gaudi in one sentence."}],
     "max_tokens": 64,
     "temperature": 0
   }' | jq
 ```
 
-3) Switch model in-process:
+1) Switch model in-process:
 
 ```bash
 curl -s http://localhost:8080/v1/models/switch \
@@ -79,14 +73,14 @@ curl -s http://localhost:8080/v1/models/switch \
   }' | jq
 ```
 
-4) Generate with switched model:
+1) Generate with switched model:
 
 ```bash
 curl -s http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen",
-    "messages": [{"role": "user", "content": "Explain Gaudi in one sentence."}],
+    "messages": [{"role": "user", "content": "Explain Intel Gaudi in one sentence."}],
     "max_tokens": 64,
     "temperature": 0
   }' | jq
@@ -95,22 +89,15 @@ curl -s http://localhost:8080/v1/chat/completions \
 ## CI-friendly one-command flow
 
 ```bash
-cd /home/scolabre/vllm-gaudi
+cd /path/to/vllm-gaudi
 bash tests/full_tests/ci_e2e_discoverable_tests.sh run_single_process_model_swap_online_e2e_test
 ```
 
-## Operational Guidance
-
-- Keep `tensor_parallel_size` and key runtime options consistent across model entries unless you have validated mixed setups.
-- Start with two models, then increase only after repeated swap-cycle testing.
-- Track swap duration and memory behavior during N consecutive cycles before production rollout.
-
 ## Rollback
 
-To disable this mode, unset multi-model env flags and use standard serving:
+To disable this mode, unset multi-model env flag and use standard serving:
 
 ```bash
-unset VLLM_GAUDI_MULTI_MODEL
-unset VLLM_GAUDI_MULTI_MODEL_CONFIG
+unset VLLM_HPU_MULTI_MODEL_CONFIG
 vllm serve <your-model>
 ```

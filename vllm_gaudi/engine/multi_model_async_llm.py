@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Simplified multi-model support for AsyncLLM on Gaudi platform.
+"""Multi-model support for AsyncLLM on Gaudi platform.
 
-This is a simplified version that removes complex mode/pause handling
+Simplified version that does not use complex mode/pause handling
 and focuses on core functionality: initialize -> generate -> switch -> generate.
 """
 
@@ -26,7 +26,7 @@ logger = init_logger(__name__)
 
 class MultiModelAsyncLLM:
     """
-    Simplified wrapper around AsyncLLM for dynamic model switching.
+    Wrapper around AsyncLLM for dynamic model switching.
     
     Usage flow:
     1. Create with model configs: MultiModelAsyncLLM({"model_a": config_a, "model_b": config_b})
@@ -83,10 +83,10 @@ class MultiModelAsyncLLM:
         self.enable_log_requests = enable_log_requests
 
         # Pre-create VllmConfig for each model
-        logger.info(f"Creating configs for {len(model_configs)} models")
+        logger.info("Creating configs for %s models", len(model_configs))
         for name, args in model_configs.items():
             self._vllm_configs[name] = args.create_engine_config(usage_context)
-            logger.info(f"  {name}: {self._vllm_configs[name].model_config.model}")
+            logger.info("  %s: %s", name, self._vllm_configs[name].model_config.model)
 
     @property
     def current_model(self) -> Optional[str]:
@@ -138,7 +138,7 @@ class MultiModelAsyncLLM:
 
         if self._engine is not None:
             raise RuntimeError("Engine already initialized. Use switch_model() instead.")
-        logger.info(f"Initializing engine with: {model_name}")
+        logger.info("Initializing engine with: %s", model_name)
         args = self.model_configs[model_name]
         args.disable_log_stats = self.disable_log_stats
         args.enable_log_requests = self.enable_log_requests
@@ -149,12 +149,11 @@ class MultiModelAsyncLLM:
             usage_context=self.usage_context,
         )
         self._sleeping[model_name] = False
-        logger.info(f"Model sleep state: {model_name}=awake")
+        logger.info("Model sleep state: %s=awake", model_name)
 
         self._current_model_name = model_name
 
-        logger.info(f"Engine initialized with: "
-                    f"{self._vllm_configs[model_name].model_config.model}")
+        logger.info("Engine initialized with: %s", self._vllm_configs[model_name].model_config.model)
 
     async def switch_model(
         self,
@@ -190,12 +189,12 @@ class MultiModelAsyncLLM:
                 raise ValueError(f"Model '{model_name}' not found. Available: {list(self.model_configs.keys())}")
 
             if model_name == self._current_model_name:
-                logger.info(f"Model '{model_name}' already loaded.")
+                logger.info("Model '%s' already loaded.", model_name)
                 return
 
             new_model = self._vllm_configs[model_name].model_config.model
 
-            logger.info(f"Switching from {self._current_model_name} to {model_name}")
+            logger.info("Switching from %s to %s", self._current_model_name, model_name)
 
             try:
                 # Step 1: Drain pending requests
@@ -206,7 +205,7 @@ class MultiModelAsyncLLM:
                         timeout=drain_timeout + 5,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(f"Drain timeout ({drain_timeout}s) exceeded. Proceeding with caution.")
+                    logger.warning("Drain timeout (%ss) exceeded. Proceeding with caution.", drain_timeout)
 
                 # Step 2: Reconfigure engine core and scheduler in-process
                 logger.info(
@@ -214,7 +213,7 @@ class MultiModelAsyncLLM:
                     self._current_model_name,
                     model_name,
                 )
-                logger.info(f"Reconfiguring engine for: {model_name}")
+                logger.info("Reconfiguring engine for: %s", model_name)
                 serialized_config = cloudpickle.dumps(self._vllm_configs[model_name])
                 reconfigure_start = time.perf_counter()
                 await self._engine.engine_core.call_utility_async(
@@ -228,30 +227,31 @@ class MultiModelAsyncLLM:
                 )
                 self._sleeping[self._current_model_name] = True
                 self._sleeping[model_name] = False
-                logger.info(f"Model sleep state: {self._current_model_name}=sleeping")
-                logger.info(f"Model sleep state: {model_name}=awake")
+                logger.info("Model sleep state: %s=sleeping", self._current_model_name)
+                logger.info("Model sleep state: %s=awake", model_name)
 
                 self._current_model_name = model_name
-                logger.info(f"Successfully switched to: {new_model}")
+                logger.info("Successfully switched to: %s", new_model)
 
             except Exception as e:
-                logger.error(f"Model switch failed during {e.__class__.__name__}: {e}. "
-                             f"Attempting to restore engine state...")
+                logger.error("Model switch failed during %s: %s. Attempting to restore engine state...",
+                             e.__class__.__name__, e)
                 # Attempt recovery: wake up engine if it's stuck in sleep
                 try:
                     logger.info("Attempting to wake up engine for recovery...")
                     await self._engine.wake_up(tags=["weights", "kv_cache"])
                     if self._current_model_name is not None:
                         self._sleeping[self._current_model_name] = False
-                        logger.info(f"Model sleep state: {self._current_model_name}=awake")
+                        logger.info("Model sleep state: %s=awake", self._current_model_name)
                     logger.warning("Engine woken up. May still be in inconsistent state. "
                                    "Manual restart recommended if issues persist.")
                 except Exception as recovery_error:
-                    logger.error(f"Recovery failed: {recovery_error.__class__.__name__}: {recovery_error}. "
-                                 f"Engine may be unresponsive. Manual server restart required.")
+                    logger.error("Recovery failed: %s: %s. Engine may be unresponsive. Manual server restart required.",
+                                 recovery_error.__class__.__name__, recovery_error)
 
                 # Re-raise original exception with context
-                raise RuntimeError(f"Failed to switch model from {self._current_model_name} to {model_name}: {e}") from e
+                raise RuntimeError(
+                    f"Failed to switch model from {self._current_model_name} to {model_name}: {e}") from e
 
     async def generate(
         self,

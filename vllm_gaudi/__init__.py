@@ -38,7 +38,6 @@ def register_ops():
     import vllm_gaudi.ops.hpu_mm_encoder_attention  # noqa: F401
     import vllm_gaudi.ops.hpu_row_parallel_linear  # noqa: F401
     import vllm_gaudi.ops.hpu_weights  # noqa: F401
-    
     # Register HPU LoRA layers that handle HPURowParallelLinear
     from vllm_gaudi.lora.layers.hpu_row_parallel_linear import register_hpu_lora_layers
     register_hpu_lora_layers()
@@ -51,23 +50,3 @@ def register_models():
     import vllm_gaudi.models.roberta  # noqa: F401
     from .models import register_model
     register_model()
-
-def get_multi_model_engine():
-    """
-    Get MultiModelAsyncLLM for dynamic model switching.
-
-    Returns:
-        MultiModelAsyncLLM class
-    """
-    from vllm_gaudi.engine import MultiModelAsyncLLM
-    return MultiModelAsyncLLM
-
-
-__all__ = [
-    "register",
-    "register_utils",
-    "register_ops",
-    "register_models",
-    "get_multi_model_engine",
-]
-
