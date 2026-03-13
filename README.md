@@ -67,13 +67,6 @@ The vLLM Hardware Plugin for Intel® Gaudi® integrates [Intel® Gaudi® AI acce
 
     To see all the available installation methods, such as NIXL, see the [Installation](https://vllm-gaudi.readthedocs.io/en/latest/getting_started/installation.html) guide.
 
-  ## Experimental: Single-Process Model Swap
-
-  The plugin provides an experimental single-process model swap path for Gaudi, designed for sequential serving of multiple small models on the same HPU card without process restart.
-
-  - Feature overview and setup: [Supported Features](https://vllm-gaudi.readthedocs.io/en/latest/features/supported_features.html#single-process-model-swap)
-  - Architecture delta: [Design Overview](https://vllm-gaudi.readthedocs.io/en/latest/design/single_process_model_swap_arch_overview/)
-
 ## Contributing
 
 We welcome and value any contributions and collaborations.

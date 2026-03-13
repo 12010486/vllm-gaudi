@@ -75,9 +75,9 @@ To enable the feature:
    "dynamicquantization": "True",
    "scaleformat": "CONST"
    ```
-### Single Process model swap
+### Single-Process Model Swap
 
-This feature allows a hot swap of models within AsyncLLM(), without restarting the Engine nor killing the process. The in-process model swap is needed when multiple small models want to sequentially share the same HPU card. It is building on top of sleep model Level 1.
+This feature enables sequential serving of multiple small models on the same HPU card without process restart.The model swap is built on top of sleep model Level 1.
 
 To enable the feature:
 
@@ -97,14 +97,12 @@ models:
 2. Add as environment variables:
  ```
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
-export VLLM_GAUDI_MULTI_MODEL=1
-export VLLM_GAUDI_MULTI_MODEL_CONFIG=/path/to/multi_models.yaml
+export VLLM_SERVER_DEV_MODE=1
+export VLLM_HPU_MULTI_MODEL_CONFIG=/path/to/multi_models.yaml
  ```
-   Compatibility aliases also supported: `VLLM_HPU_MULTI_MODEL` and `VLLM_HPU_MULTI_MODEL_CONFIG`.
 3. Launch the server from the new OpenAI compatible API as:
 ```
-python -m vllm_gaudi.entrypoints.openai.multi_model_api_server \
-  --port 8080
+python -m vllm_gaudi.entrypoints.openai.multi_model_api_server --port 8080
 ```
 See full online walkthrough in [Single-Process Model Swap (Online Quickstart)](../getting_started/quickstart/quickstart_single_process_model_swap_online.md).
 

@@ -1,16 +1,18 @@
 # Architecture Overview
 
-This document provides an overview of the vLLM-gaudi architecture integration to allow a single-process model swap. Original v1 vllm architecture is multi-process based, and described in `vllm/docs/design/arch_overview.md`. Only **delta** modifications are presented.
+This document provides an overview of the vLLM-gaudi architecture integration to allow a single-process model swap. Original v1 vllm architecture is multi-process based, and described in `vllm/docs/design/arch_overview.md`. Only modifications are presented.
 
 ## Entrypoints
 
 vLLM provides a number of entrypoints for interacting with the system. The standard one for online inference is `OpenAI API Server`. We increased the HTTP entrypoints compatible with OpenAI API in order to control the single process models swap feature.
 
 ### OpenAI-Compatible Gaudi API Server
-The entrypoint can be launched directly via:
+The server can be launched directly via:
 
 ```bash
+export VLLM_SERVER_DEV_MODE=1 
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_HPU_MULTI_MODEL_CONFIG=/path/to/multi_models.yaml
 python -m vllm_gaudi.entrypoints.openai.multi_model_api_server
 ```
 
@@ -52,7 +54,7 @@ That code can be found in [vllm_gaudi/entrypoints/openai/multi_model_api_server.
    - request block hasher and batch queue helpers
 7. Resume scheduler.
 
-## State Rebuild Delta (Why It Is Required)
+## State Rebuild Delta
 
 The model swap path rebuilds runtime state that is model-shape or scheduler-policy dependent. This avoids carrying stale state across model boundaries (for example incompatible layer bindings or stale block-table assumptions).
 
@@ -64,35 +66,3 @@ Rebuilt state includes:
 - multimodal receiver cache
 - request block hashing setup
 - queueing/execution helper state (`batch_queue`, `step_fn`, abort queue)
-
-## Maintainability Guardrails
-
-To keep this feature maintainable over time:
-
-1. **Single owner contract**
-   - Keep swap orchestration logic centralized in `MultiModelAsyncLLM`.
-   - Avoid duplicating switch flow in entrypoints or worker code.
-
-2. **Patch boundary discipline**
-   - Keep `EngineCore` patch minimal and Gaudi-scoped.
-   - If upstream internals change, update only the patch adapter layer first.
-
-3. **Config compatibility policy**
-   - Prefer swaps between models with aligned runtime assumptions (parallelism, cache behavior, scheduling expectations).
-   - Validate heterogeneous model pairs with explicit smoke cycles.
-
-4. **Test matrix (minimum)**
-   - init -> generate -> switch -> generate
-   - no-op switch
-   - invalid model switch
-   - repeated switch cycles (stability)
-
-5. **Operational rollback**
-   - Keep feature fully toggleable via env flags.
-   - Preserve standard `vllm serve` path as immediate fallback.
-
-## Recommended Pre-PR Evidence
-
-- Include one online smoke transcript (models list, completion, switch, completion).
-- Include swap latency summary over multiple cycles.
-- Include memory trend snapshot before/after repeated swaps.
