@@ -158,12 +158,13 @@ class HPUWorker(WorkerBase):
         return self.model_runner.get_model()
 
     def _clear_model(self) -> None:
-        """Clear model runner and without shutting down the worker."""
+        """Clear model runner without shutting down the worker."""
         if hasattr(self, 'model_runner') and self.model_runner is not None:
             if hasattr(self.model_runner, 'model') and self.model_runner.model is not None:
                 try:
+                    import torch as _torch
                     for param in self.model_runner.model.parameters():
-                        param.data = torch.empty(0, device='cpu')
+                        param.data = _torch.empty(0)
                 except Exception as e:
                     logger.warning("[HPUWorker] Error clearing model parameters: %s", e)
                 del self.model_runner.model
@@ -173,6 +174,19 @@ class HPUWorker(WorkerBase):
             self.model_runner = None
 
         gc.collect()
+        gc.collect()
+        # Return freed memory to OS (Linux)
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:
+            pass
+        try:
+            import torch
+            torch.hpu.synchronize()
+        except Exception:
+            pass
 
     def unload_model(self) -> None:
         """Unload current model weights without shutting down the worker."""
