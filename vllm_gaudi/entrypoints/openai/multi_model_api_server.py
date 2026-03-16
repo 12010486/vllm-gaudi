@@ -524,8 +524,7 @@ async def _run_multi_model_server(args: Namespace) -> None:
 
 
 def _should_use_multi_model() -> bool:
-    return (_env_truthy(os.environ.get("VLLM_GAUDI_MULTI_MODEL"))
-            or _env_truthy(os.environ.get("VLLM_HPU_MULTI_MODEL")))
+    return _resolve_multi_model_config_path() is not None
 
 
 if __name__ == "__main__":
