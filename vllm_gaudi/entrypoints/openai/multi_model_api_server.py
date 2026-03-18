@@ -258,7 +258,7 @@ def _env_truthy(value: str | None) -> bool:
 
 
 def _resolve_multi_model_config_path() -> str | None:
-    return (os.environ.get("VLLM_GAUDI_MULTI_MODEL_CONFIG") or os.environ.get("VLLM_HPU_MULTI_MODEL_CONFIG"))
+    return os.environ.get("VLLM_HPU_MULTI_MODEL_CONFIG")
 
 
 def _load_multi_model_config(path: str) -> tuple[dict[str, AsyncEngineArgs], str]:
@@ -312,8 +312,7 @@ async def build_multi_model_engine_client(
     config_path = _resolve_multi_model_config_path()
     if not config_path:
         raise ValueError("A multi-model config path must be set when multi-model mode is enabled. "
-                         "Supported env vars: VLLM_GAUDI_MULTI_MODEL_CONFIG, "
-                         "VLLM_HPU_MULTI_MODEL_CONFIG.")
+                         "Supported env var: VLLM_HPU_MULTI_MODEL_CONFIG.")
 
     model_configs, default_model = _load_multi_model_config(config_path)
     manager = MultiModelAsyncLLM(

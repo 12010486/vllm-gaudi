@@ -21,7 +21,7 @@ logger = init_logger(__name__)
 
 
 def _reset_executor_sleep_state(model_executor: Any) -> None:
-    """Clear executor sleep bookkeeping after successful reconfigure."""
+    """Clear executor sleeping tags after successful reconfigure."""
     if not getattr(model_executor, "is_sleeping", False):
         return
 
@@ -33,7 +33,7 @@ def _reset_executor_sleep_state(model_executor: Any) -> None:
             model_executor.sleeping_tags = set()
 
     model_executor.is_sleeping = False
-    logger.info("[gaudi_reconfigure] executor sleep bookkeeping reset")
+    logger.info("[gaudi_reconfigure] executor sleeping tags reset")
 
 
 def install_engine_core_patch() -> None:

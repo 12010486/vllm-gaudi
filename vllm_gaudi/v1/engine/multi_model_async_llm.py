@@ -152,8 +152,6 @@ class MultiModelAsyncLLM:
             usage_context=self.usage_context,
         )
         self._sleeping[model_name] = False
-        logger.info("Model sleep state: %s=awake", model_name)
-
         self._current_model_name = model_name
 
         logger.info("Engine initialized with: %s", self._vllm_configs[model_name].model_config.model)
@@ -211,11 +209,6 @@ class MultiModelAsyncLLM:
                     logger.warning("Drain timeout (%ss) exceeded. Proceeding with caution.", drain_timeout)
 
                 # Step 2: Reconfigure engine core and scheduler in-process
-                logger.info(
-                    "[gaudi_reconfigure] caller start: from=%s to=%s",
-                    self._current_model_name,
-                    model_name,
-                )
                 logger.info("Reconfiguring engine for: %s", model_name)
                 serialized_config = cloudpickle.dumps(self._vllm_configs[model_name])
                 reconfigure_start = time.perf_counter()
