@@ -70,7 +70,8 @@ def install_engine_core_patch() -> None:
         except Exception as exc:  # pragma: no cover - best effort
             logger.warning("Failed to sleep executor before reconfigure: %s", exc)
 
-        # Reload model weights/config on workers.
+        # Unload model put to sleep, reload new model on worker
+        self.collective_rpc("unload_model")
         self.collective_rpc("load_model", kwargs={"vllm_config": new_config})
         logger.info("[gaudi_reconfigure] worker model reload complete")
 

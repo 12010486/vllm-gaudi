@@ -167,10 +167,7 @@ class HPUWorker(WorkerBase):
                         param.data = _torch.empty(0)
                 except Exception as e:
                     logger.warning("[HPUWorker] Error clearing model parameters: %s", e)
-                del self.model_runner.model
                 self.model_runner.model = None
-
-            del self.model_runner
             self.model_runner = None
 
         gc.collect()
@@ -193,41 +190,19 @@ class HPUWorker(WorkerBase):
         logger.info("[HPUWorker] Unloading current model")
         self._clear_model()
 
-    def _apply_vllm_config(self, vllm_config: VllmConfig) -> None:
-        self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.cache_config = vllm_config.cache_config
-        self.lora_config = getattr(vllm_config, 'lora_config', None)
-        self.load_config = vllm_config.load_config
-        self.parallel_config = vllm_config.parallel_config
-        self.parallel_config.rank = self.rank
-        self.scheduler_config = vllm_config.scheduler_config
-        self.device_config = vllm_config.device_config
-        self.speculative_config = getattr(vllm_config, 'speculative_config', None)
-        self.observability_config = getattr(vllm_config, 'observability_config', None)
-
-        if self.cache_config.cache_dtype == "auto":
-            self.cache_dtype = self.model_config.dtype
-        else:
-            self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[self.cache_config.cache_dtype]
-
     def load_model(
         self,
         vllm_config: Optional[VllmConfig] = None,
     ) -> None:
         """Load a model. If vllm_config is provided, update config and rebuild runner."""
         if vllm_config is not None:
-            self._apply_vllm_config(vllm_config)
-            self._clear_model()
-            with set_current_vllm_config(self.vllm_config):
+            with set_current_vllm_config(vllm_config):
                 self.model_runner = HPUModelRunner(
-                    vllm_config=self.vllm_config,
+                    vllm_config=vllm_config,
                     is_driver_worker=self.is_driver_worker,
                 )
-
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
-        self.model_sleeping = False
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
