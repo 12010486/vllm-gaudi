@@ -20,6 +20,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.pooling_params import PoolingParams
 from vllm.outputs import RequestOutput, PoolingRequestOutput
 from vllm.inputs import PromptType, ProcessorInputs
+from vllm_gaudi.v1.engine.core_patch import install_engine_core_patch
 
 logger = init_logger(__name__)
 
@@ -27,7 +28,7 @@ logger = init_logger(__name__)
 class MultiModelAsyncLLM:
     """
     Wrapper around AsyncLLM for dynamic model switching.
-    
+
     Usage flow:
     1. Create with model configs: MultiModelAsyncLLM({"model_a": config_a, "model_b": config_b})
     2. Initialize with first model: await manager.initialize("model_a")
@@ -35,11 +36,11 @@ class MultiModelAsyncLLM:
     4. Switch models: await manager.switch_model("model_b")
     5. Generate with new model
     6. Cleanup: manager.shutdown()
-    
+
     Example:
         >>> from vllm.engine.arg_utils import AsyncEngineArgs
-        >>> from vllm_gaudi.engine import MultiModelAsyncLLM
-        >>> 
+        >>> from vllm_gaudi.v1.engine.multi_model_async_llm import MultiModelAsyncLLM
+        >>>
         >>> models = {
         ...     "model_a": AsyncEngineArgs(model="meta-llama/Llama-3.1-8B-Instruct"),
         ...     "model_b": AsyncEngineArgs(model="Qwen/Qwen3-0.6B"),
@@ -61,13 +62,15 @@ class MultiModelAsyncLLM:
     ):
         """
         Initialize multi-model manager.
-        
+
         Args:
             model_configs: Dict mapping model names to AsyncEngineArgs
             usage_context: Engine usage context
             disable_log_stats: Disable stats logging
             enable_log_requests: Enable request logging
         """
+        install_engine_core_patch()
+
         self._engine: Optional[AsyncLLM] = None
         self._sleeping: dict[str, bool] = {}
         self._current_model_name: Optional[str] = None
@@ -125,10 +128,10 @@ class MultiModelAsyncLLM:
     async def initialize(self, model_name: str) -> None:
         """
         Initialize engine with a model.
-        
+
         Args:
             model_name: Model to load (must be in model_configs)
-        
+
         Raises:
             ValueError: If model_name not found
             RuntimeError: If already initialized
@@ -162,20 +165,20 @@ class MultiModelAsyncLLM:
     ) -> None:
         """
         Switch to a different model with error recovery
-        
+
         Steps:
         1. Drain pending requests (with timeout)
         2. Sleep current model (free KV cache + weights)
         3. Unload current model weights
         4. Reload new model on the same engine
         5. Reinitialize KV cache for new model
-        
+
         If any step fails, attempts to wake up engine to restore state.
 
         Args:
             model_name: Target model name
             drain_timeout: Seconds to wait for requests to drain
-        
+
         Raises:
             ValueError: If model not found
             RuntimeError: If engine not initialized or switch fails
@@ -262,16 +265,16 @@ class MultiModelAsyncLLM:
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Generate completion for prompt.
-        
+
         Args:
             prompt: Input prompt
             sampling_params: Sampling parameters
             request_id: Unique request ID
             **kwargs: Additional args passed to AsyncLLM.generate()
-        
+
         Yields:
             RequestOutput: Generation outputs
-        
+
         Raises:
             RuntimeError: If engine not initialized
         """
@@ -290,16 +293,16 @@ class MultiModelAsyncLLM:
     ) -> AsyncGenerator[PoolingRequestOutput, None]:
         """
         Encode input for embedding/pooling models.
-        
+
         Args:
             prompt: Input prompt
             pooling_params: Pooling parameters
             request_id: Unique request ID
             **kwargs: Additional args passed to AsyncLLM.encode()
-        
+
         Yields:
             PoolingRequestOutput: Encoding outputs
-        
+
         Raises:
             RuntimeError: If engine not initialized
         """

@@ -36,7 +36,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.system_utils import decorate_logs
 
-from vllm_gaudi.engine.multi_model_async_llm import MultiModelAsyncLLM
+from vllm_gaudi.v1.engine.multi_model_async_llm import MultiModelAsyncLLM
 
 logger = init_logger("vllm_gaudi.entrypoints.openai.multi_model_api_server")
 

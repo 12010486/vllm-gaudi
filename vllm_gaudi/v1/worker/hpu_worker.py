@@ -193,33 +193,31 @@ class HPUWorker(WorkerBase):
         logger.info("[HPUWorker] Unloading current model")
         self._clear_model()
 
+    def _apply_vllm_config(self, vllm_config: VllmConfig) -> None:
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.lora_config = getattr(vllm_config, 'lora_config', None)
+        self.load_config = vllm_config.load_config
+        self.parallel_config = vllm_config.parallel_config
+        self.parallel_config.rank = self.rank
+        self.scheduler_config = vllm_config.scheduler_config
+        self.device_config = vllm_config.device_config
+        self.speculative_config = getattr(vllm_config, 'speculative_config', None)
+        self.observability_config = getattr(vllm_config, 'observability_config', None)
+
+        if self.cache_config.cache_dtype == "auto":
+            self.cache_dtype = self.model_config.dtype
+        else:
+            self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[self.cache_config.cache_dtype]
+
     def load_model(
         self,
         vllm_config: Optional[VllmConfig] = None,
-        vllm_config_bytes: Optional[bytes] = None,
     ) -> None:
         """Load a model. If vllm_config is provided, update config and rebuild runner."""
-        if vllm_config_bytes is not None:
-            import cloudpickle
-            vllm_config = cloudpickle.loads(vllm_config_bytes)
         if vllm_config is not None:
-            self.vllm_config = vllm_config
-            self.model_config = vllm_config.model_config
-            self.cache_config = vllm_config.cache_config
-            self.lora_config = getattr(vllm_config, 'lora_config', None)
-            self.load_config = vllm_config.load_config
-            self.parallel_config = vllm_config.parallel_config
-            self.parallel_config.rank = self.rank
-            self.scheduler_config = vllm_config.scheduler_config
-            self.device_config = vllm_config.device_config
-            self.speculative_config = getattr(vllm_config, 'speculative_config', None)
-            self.observability_config = getattr(vllm_config, 'observability_config', None)
-
-            if self.cache_config.cache_dtype == "auto":
-                self.cache_dtype = self.model_config.dtype
-            else:
-                self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[self.cache_config.cache_dtype]
-
+            self._apply_vllm_config(vllm_config)
             self._clear_model()
             with set_current_vllm_config(self.vllm_config):
                 self.model_runner = HPUModelRunner(
@@ -377,6 +375,7 @@ class HPUWorker(WorkerBase):
         with HabanaMemoryProfiler() as m:
             self.kv_cache_config = kv_cache_config
             self.model_runner.initialize_kv_cache(kv_cache_config)
+            self.kv_cache_sleeping = False
             torch.hpu.synchronize()
         if len(self.model_runner.kv_caches) > 0:
             msg = (f"Usable num_blocks: {kv_cache_config.num_blocks}, "

@@ -22,10 +22,10 @@ That code can be found in [vllm_gaudi/entrypoints/openai/multi_model_api_server.
 
 | Component | Type | Role in Model Swap |
 |---|---|---|
-| `vllm_gaudi.engine.MultiModelAsyncLLM` | New manager wrapper | Owns multi-model configs, serializes swap requests, drains in-flight requests, and triggers in-process reconfigure |
-| `install_engine_core_patch()` | Runtime patch installer | Injects `gaudi_reconfigure_engine()` into V1 `EngineCore` at import time |
+| `vllm_gaudi.v1.engine.MultiModelAsyncLLM` | New manager wrapper | Owns multi-model configs, serializes swap requests, drains in-flight requests, and triggers in-process reconfigure |
+| `install_engine_core_patch()` | Runtime patch installer | Injects `gaudi_reconfigure_engine()` into V1 `EngineCore` at load_general_plugins() time |
 | `EngineCore.gaudi_reconfigure_engine()` | Added utility method (patched) | Performs in-place runtime rebuild: pause/sleep, worker reload, KV cache re-init, scheduler/state reconstruction, resume |
-| `HPUWorker.load_model(vllm_config_bytes=...)` | Extended worker load path | Accepts cloudpickled `VllmConfig` and reloads model runner/model with new config |
+| `HPUWorker.load_model()` | Extended worker load path | Reloads model runner/model with new config |
 | `HPUWorker._rebuild_kv_cache_config_for_current_model(...)` | New helper | Rebuilds KV cache layer mappings from current model spec to prevent stale block-table/layer mapping state |
 
 ## Control Plane Delta: Switch Flow

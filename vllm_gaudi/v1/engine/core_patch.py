@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Gaudi-only patch to add an in-process engine reconfigure path."""
+"""Gaudi v1-only patch to add an in-process engine reconfigure path."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def install_engine_core_patch() -> None:
             logger.warning("Failed to sleep executor before reconfigure: %s", exc)
 
         # Reload model weights/config on workers.
-        self.collective_rpc("load_model", kwargs={"vllm_config_bytes": vllm_config_bytes})
+        self.collective_rpc("load_model", kwargs={"vllm_config": new_config})
         logger.info("[gaudi_reconfigure] worker model reload complete")
 
         # Update config and reinitialize KV caches.

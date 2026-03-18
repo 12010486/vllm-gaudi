@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 import yaml
 
-from vllm_gaudi.engine.multi_model_async_llm import MultiModelAsyncLLM
+from vllm_gaudi.v1.engine.multi_model_async_llm import MultiModelAsyncLLM
 from vllm_gaudi.entrypoints.openai import multi_model_api_server as api_server
 
 
@@ -97,7 +97,7 @@ async def test_initialize_and_switch_reconfigures_engine(mock_engine):
         "qwen": _FakeAsyncEngineArgs("Qwen/Qwen3-0.6B"),
     }
 
-    with patch("vllm_gaudi.engine.multi_model_async_llm.AsyncLLM.from_engine_args", return_value=mock_engine):
+    with patch("vllm_gaudi.v1.engine.multi_model_async_llm.AsyncLLM.from_engine_args", return_value=mock_engine):
         manager = MultiModelAsyncLLM(model_configs)
         await manager.initialize("llama")
         await manager.switch_model("qwen", drain_timeout=1)
@@ -113,7 +113,7 @@ async def test_switch_same_model_is_noop(mock_engine):
         "llama": _FakeAsyncEngineArgs("meta-llama/Llama-3.1-8B-Instruct"),
     }
 
-    with patch("vllm_gaudi.engine.multi_model_async_llm.AsyncLLM.from_engine_args", return_value=mock_engine):
+    with patch("vllm_gaudi.v1.engine.multi_model_async_llm.AsyncLLM.from_engine_args", return_value=mock_engine):
         manager = MultiModelAsyncLLM(model_configs)
         await manager.initialize("llama")
         await manager.switch_model("llama")
