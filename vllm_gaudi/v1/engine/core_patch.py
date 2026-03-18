@@ -20,6 +20,22 @@ from vllm.v1.structured_output import StructuredOutputManager
 logger = init_logger(__name__)
 
 
+def _reset_executor_sleep_state(model_executor: Any) -> None:
+    """Clear executor sleep bookkeeping after successful reconfigure."""
+    if not getattr(model_executor, "is_sleeping", False):
+        return
+
+    if hasattr(model_executor, "sleeping_tags"):
+        sleeping_tags = model_executor.sleeping_tags
+        if hasattr(sleeping_tags, "clear"):
+            sleeping_tags.clear()
+        else:
+            model_executor.sleeping_tags = set()
+
+    model_executor.is_sleeping = False
+    logger.info("[gaudi_reconfigure] executor sleep bookkeeping reset")
+
+
 def install_engine_core_patch() -> None:
     """Install a Gaudi-only EngineCore reconfigure hook."""
     from vllm.v1.engine.core import EngineCore
@@ -46,8 +62,11 @@ def install_engine_core_patch() -> None:
 
         # Sleep to release device memory before reloading weights.
         try:
-            self.model_executor.sleep(level=1)
-            logger.info("[gaudi_reconfigure] executor slept (level=1)")
+            if getattr(self.model_executor, "is_sleeping", False):
+                logger.warning("[gaudi_reconfigure] executor already marked sleeping before reconfigure")
+            else:
+                self.model_executor.sleep(level=1)
+                logger.info("[gaudi_reconfigure] executor slept (level=1)")
         except Exception as exc:  # pragma: no cover - best effort
             logger.warning("Failed to sleep executor before reconfigure: %s", exc)
 
@@ -127,6 +146,8 @@ def install_engine_core_patch() -> None:
         self.async_scheduling = new_config.scheduler_config.async_scheduling
         self.aborts_queue = queue.Queue()
         logger.info("[gaudi_reconfigure] execution state rebuilt")
+
+        _reset_executor_sleep_state(self.model_executor)
 
         # Resume scheduler after reconfigure.
         self.resume_scheduler()
