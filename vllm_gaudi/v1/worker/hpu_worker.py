@@ -93,6 +93,10 @@ class HPUWorker(WorkerBase):
         self.model_sleeping = False
         self.kv_cache_sleeping = False
         self.kv_cache_config = None
+        # Stash of HPUModelRunner instances keyed by model path, so compiled
+        # HPU graphs (ModuleCacher) survive a sleep→unload→reload cycle without
+        # repeating warmup_graphs.  Weights are on CPU while stashed.
+        self._model_runner_stash: dict[str, HPUModelRunner] = {}
 
     def init_profiler(self):
         """Initialize the profiler."""
@@ -189,15 +193,40 @@ class HPUWorker(WorkerBase):
             pass
 
     def unload_model(self) -> None:
-        """Unload current model weights without shutting down the worker."""
-        logger.info("[HPUWorker] Unloading current model")
-        self._clear_model()
+        """Stash the current HPUModelRunner (weights already on CPU from sleep)
+        so its compiled ModuleCacher graph dict survives across model switches.
+        On a subsequent load_model() for the same model the runner is restored
+        directly, skipping warmup_graphs entirely.
+        """
+        if hasattr(self, 'model_runner') and self.model_runner is not None:
+            model_id = self.vllm_config.model_config.model
+            logger.info("[HPUWorker] Stashing runner for model: %s", model_id)
+            self._model_runner_stash[model_id] = self.model_runner
+            self.model_runner = None
+        self.kv_cache_config = None
+        self.kv_cache_sleeping = False
+        gc.collect()
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:
+            pass
+        try:
+            torch.hpu.synchronize()
+        except Exception:
+            pass
 
     def load_model(
         self,
         vllm_config: Optional[VllmConfig] = None,
     ) -> None:
-        """Load a model. If vllm_config is provided, update config and rebuild runner."""
+        """Load a model. If vllm_config is provided, update config and rebuild runner.
+
+        If a runner was previously stashed for this model (weights on CPU from
+        a prior sleep→unload cycle) it is restored directly and weights are
+        moved back to HPU, skipping the expensive warmup_graphs phase.
+        """
         if vllm_config is not None:
             self.vllm_config = vllm_config
             self.model_config = vllm_config.model_config
@@ -209,6 +238,20 @@ class HPUWorker(WorkerBase):
             self.device_config = vllm_config.device_config
             self.speculative_config = vllm_config.speculative_config
             self.observability_config = vllm_config.observability_config
+
+            model_id = vllm_config.model_config.model
+            if model_id in self._model_runner_stash:
+                # Runner is alive with compiled graph cache intact;
+                # weights are on CPU — just move them back to HPU.
+                logger.info("[HPUWorker] Restoring stashed runner for model: %s", model_id)
+                self.model_runner = self._model_runner_stash.pop(model_id)
+                # wake_up(weights) checks self.model_sleeping; set it first.
+                self.model_sleeping = True
+                self.wake_up(tags=["weights"])
+                # model_sleeping is cleared by wake_up; kv_cache handled by
+                # _initialize_kv_caches called separately by gaudi_reconfigure.
+                self.kv_cache_sleeping = False
+                return
 
             with set_current_vllm_config(vllm_config):
                 self.model_runner = HPUModelRunner(
@@ -601,3 +644,4 @@ def track_graph_compile(name: str):
     if gc.stats()[0][1] != 0:
         msg = f"[{name}] graph compilation detected: {gc.stats()}"
         logger.warning(msg)
+
