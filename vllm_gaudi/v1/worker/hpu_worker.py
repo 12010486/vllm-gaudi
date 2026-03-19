@@ -93,10 +93,32 @@ class HPUWorker(WorkerBase):
         self.model_sleeping = False
         self.kv_cache_sleeping = False
         self.kv_cache_config = None
-        # Stash of HPUModelRunner instances keyed by model path, so compiled
-        # HPU graphs (ModuleCacher) survive a sleep→unload→reload cycle without
-        # repeating warmup_graphs.  Weights are on CPU while stashed.
-        self._model_runner_stash: dict[str, HPUModelRunner] = {}
+        self._model_runner_stash: dict[tuple[object, ...], HPUModelRunner] = {}
+
+    def _apply_vllm_config(self, vllm_config: VllmConfig) -> None:
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.lora_config = vllm_config.lora_config
+        self.load_config = vllm_config.load_config
+        self.parallel_config = vllm_config.parallel_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.device_config = vllm_config.device_config
+        self.speculative_config = vllm_config.speculative_config
+        self.observability_config = vllm_config.observability_config
+
+    def _runner_stash_key(self, vllm_config: VllmConfig) -> tuple[object, ...]:
+        compile_cfg = vllm_config.compilation_config
+        return (
+            vllm_config.model_config.model,
+            vllm_config.model_config.dtype,
+            vllm_config.model_config.enforce_eager,
+            vllm_config.model_config.max_model_len,
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.cache_config.block_size,
+            tuple(getattr(compile_cfg, "compile_ranges_endpoints", ()) or ()),
+            tuple(getattr(compile_cfg, "compile_sizes", ()) or ()),
+        )
 
     def init_profiler(self):
         """Initialize the profiler."""
@@ -199,9 +221,10 @@ class HPUWorker(WorkerBase):
         directly, skipping warmup_graphs entirely.
         """
         if hasattr(self, 'model_runner') and self.model_runner is not None:
-            model_id = self.vllm_config.model_config.model
-            logger.info("[HPUWorker] Stashing runner for model: %s", model_id)
-            self._model_runner_stash[model_id] = self.model_runner
+            runner_config = getattr(self.model_runner, "vllm_config", self.vllm_config)
+            stash_key = self._runner_stash_key(runner_config)
+            logger.info("[HPUWorker] Stashing runner for model: %s", runner_config.model_config.model)
+            self._model_runner_stash[stash_key] = self.model_runner
             self.model_runner = None
         self.kv_cache_config = None
         self.kv_cache_sleeping = False
@@ -228,23 +251,16 @@ class HPUWorker(WorkerBase):
         moved back to HPU, skipping the expensive warmup_graphs phase.
         """
         if vllm_config is not None:
-            self.vllm_config = vllm_config
-            self.model_config = vllm_config.model_config
-            self.cache_config = vllm_config.cache_config
-            self.lora_config = vllm_config.lora_config
-            self.load_config = vllm_config.load_config
-            self.parallel_config = vllm_config.parallel_config
-            self.scheduler_config = vllm_config.scheduler_config
-            self.device_config = vllm_config.device_config
-            self.speculative_config = vllm_config.speculative_config
-            self.observability_config = vllm_config.observability_config
+            self._apply_vllm_config(vllm_config)
 
-            model_id = vllm_config.model_config.model
-            if model_id in self._model_runner_stash:
+            stash_key = self._runner_stash_key(vllm_config)
+            if stash_key in self._model_runner_stash:
                 # Runner is alive with compiled graph cache intact;
                 # weights are on CPU — just move them back to HPU.
-                logger.info("[HPUWorker] Restoring stashed runner for model: %s", model_id)
-                self.model_runner = self._model_runner_stash.pop(model_id)
+                logger.info("[HPUWorker] Restoring stashed runner for model: %s", vllm_config.model_config.model)
+                self.model_runner = self._model_runner_stash.pop(stash_key)
+                restored_config = getattr(self.model_runner, "vllm_config", self.vllm_config)
+                self._apply_vllm_config(restored_config)
                 # wake_up(weights) checks self.model_sleeping; set it first.
                 self.model_sleeping = True
                 self.wake_up(tags=["weights"])
