@@ -170,6 +170,9 @@ class HPUWorker(WorkerBase):
                 self.model_runner.model = None
             self.model_runner = None
 
+        self.kv_cache_config = None
+        self.kv_cache_sleeping = False
+
         gc.collect()
         gc.collect()
         # Return freed memory to OS (Linux)
@@ -196,6 +199,17 @@ class HPUWorker(WorkerBase):
     ) -> None:
         """Load a model. If vllm_config is provided, update config and rebuild runner."""
         if vllm_config is not None:
+            self.vllm_config = vllm_config
+            self.model_config = vllm_config.model_config
+            self.cache_config = vllm_config.cache_config
+            self.lora_config = vllm_config.lora_config
+            self.load_config = vllm_config.load_config
+            self.parallel_config = vllm_config.parallel_config
+            self.scheduler_config = vllm_config.scheduler_config
+            self.device_config = vllm_config.device_config
+            self.speculative_config = vllm_config.speculative_config
+            self.observability_config = vllm_config.observability_config
+
             with set_current_vllm_config(vllm_config):
                 self.model_runner = HPUModelRunner(
                     vllm_config=vllm_config,
@@ -203,6 +217,9 @@ class HPUWorker(WorkerBase):
                 )
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+
+        self.model_sleeping = False
+        self.kv_cache_sleeping = False
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
