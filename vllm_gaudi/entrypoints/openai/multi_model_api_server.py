@@ -154,6 +154,9 @@ class MultiModelEngineClient(EngineClient):
     async def is_paused(self) -> bool:
         return await self._engine.is_paused()
 
+    def shutdown(self, timeout: float | None = None) -> None:
+        self.manager.shutdown()
+
     async def scale_elastic_ep(self, new_data_parallel_size: int, drain_timeout: int = 300) -> None:
         await self._engine.scale_elastic_ep(
             new_data_parallel_size=new_data_parallel_size,
