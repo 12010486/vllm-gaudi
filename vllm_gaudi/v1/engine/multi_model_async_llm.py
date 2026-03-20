@@ -20,6 +20,10 @@ from vllm.sampling_params import SamplingParams
 from vllm.pooling_params import PoolingParams
 from vllm.outputs import RequestOutput, PoolingRequestOutput
 from vllm.inputs import PromptType, ProcessorInputs
+from vllm.plugins.io_processors import get_io_processor
+from vllm.renderers import renderer_from_config
+from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.engine.output_processor import OutputProcessor
 from vllm_gaudi.v1.engine.core_patch import install_engine_core_patch
 
 logger = init_logger(__name__)
@@ -125,6 +129,49 @@ class MultiModelAsyncLLM:
             raise RuntimeError("Engine not initialized. Call initialize() first.")
         return self._engine
 
+    def _refresh_engine_frontend_config(self, model_name: str) -> None:
+        """Refresh AsyncLLM frontend state to target model config.
+
+        Engine core reloads model weights/config in-place, but AsyncLLM frontend
+        keeps its own `model_config`, renderer, and processors used by API
+        request validation/tokenization. Keep these aligned with switched model.
+        """
+        if self._engine is None:
+            raise RuntimeError("Engine not initialized. Call initialize() first.")
+
+        target_config = self._vllm_configs[model_name]
+        engine = self._engine
+
+        engine.vllm_config = target_config
+        engine.model_config = target_config.model_config
+        engine.observability_config = target_config.observability_config
+
+        if renderer := getattr(engine, "renderer", None):
+            try:
+                renderer.shutdown()
+            except Exception:
+                pass
+
+        engine.renderer = renderer = renderer_from_config(target_config)
+        engine.io_processor = get_io_processor(
+            target_config,
+            renderer,
+            target_config.model_config.io_processor_plugin,
+        )
+        engine.input_processor = InputProcessor(target_config, renderer)
+        engine.output_processor = OutputProcessor(
+            renderer.tokenizer,
+            log_stats=engine.log_stats,
+            stream_interval=target_config.scheduler_config.stream_interval,
+            tracing_enabled=target_config.observability_config.otlp_traces_endpoint is not None,
+        )
+
+        # Cancel the background output_handler task.
+        old_task = getattr(engine, "output_handler", None)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+        engine.output_handler = None
+
     async def initialize(self, model_name: str) -> None:
         """
         Initialize engine with a model.
@@ -227,6 +274,7 @@ class MultiModelAsyncLLM:
                 logger.info("Model sleep state: %s=awake", model_name)
 
                 self._current_model_name = model_name
+                self._refresh_engine_frontend_config(model_name)
                 logger.info("Successfully switched to: %s", new_model)
 
             except Exception as e:
