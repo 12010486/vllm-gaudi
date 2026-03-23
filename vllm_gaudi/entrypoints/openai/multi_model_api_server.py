@@ -26,6 +26,7 @@ from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_se
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
+from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
 from vllm.entrypoints.utils import cli_env_setup, process_lora_modules
 from vllm.logger import init_logger
@@ -368,12 +369,30 @@ async def _init_multi_model_state(
 
     resolved_chat_template = load_chat_template(args.chat_template)
 
-    state.openai_serving_tokenization = OpenAIServingTokenization(
-        engine_client,
-        state.openai_serving_models,
+    state.openai_serving_render = OpenAIServingRender(
+        model_config=engine_client.model_config,
+        renderer=engine_client.renderer,
+        io_processor=engine_client.io_processor,
+        model_registry=state.openai_serving_models.registry,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
+        trust_request_chat_template=args.trust_request_chat_template,
+        enable_auto_tools=args.enable_auto_tool_choice,
+        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
+        tool_parser=args.tool_call_parser,
+        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        log_error_stack=args.log_error_stack,
+    )
+
+    state.openai_serving_tokenization = OpenAIServingTokenization(
+        engine_client,
+        state.openai_serving_models,
+        state.openai_serving_render,
+        request_logger=request_logger,
+        chat_template=resolved_chat_template,
+        chat_template_content_format=args.chat_template_content_format,
+        default_chat_template_kwargs=args.default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template)
 
     if "generate" in supported_tasks:
