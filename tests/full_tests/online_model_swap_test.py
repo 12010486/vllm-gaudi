@@ -39,6 +39,9 @@ import time
 import requests
 import yaml
 
+_HTTP_SESSION = requests.Session()
+_HTTP_SESSION.trust_env = False
+
 SEED_PROMPTS = [
     "Hello, my name is",
     "The president of the United States is",
@@ -66,6 +69,20 @@ def generate_prompts(n=20):
 
 
 PROMPTS = generate_prompts(20)
+
+
+def _server_api_host(api_host: str) -> str:
+    """Normalize host used by the local test server."""
+    return '127.0.0.1' if api_host == 'localhost' else api_host
+
+
+def _client_api_host(api_host: str) -> str:
+    """Normalize host used by the local HTTP client."""
+    return '127.0.0.1' if api_host in {'localhost', '0.0.0.0'} else api_host
+
+
+def _api_url(api_host: str, api_port: int, path: str) -> str:
+    return f"http://{_client_api_host(api_host)}:{api_port}{path}"
 
 
 def find_free_port():
@@ -137,17 +154,20 @@ class ServerLogCapture:
 def run_server(config_path: str, api_host: str, api_port: int, log_capture: ServerLogCapture,
                max_num_batched_tokens: int):
     """Start the multi-model API server as a subprocess."""
+    server_host = _server_api_host(api_host)
     env = os.environ.copy()
     env['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'
     env['VLLM_SERVER_DEV_MODE'] = '1'
     env['VLLM_HPU_MULTI_MODEL_CONFIG'] = config_path
+    env['NO_PROXY'] = ','.join(filter(None, [env.get('NO_PROXY'), '127.0.0.1,localhost,0.0.0.0']))
+    env['no_proxy'] = ','.join(filter(None, [env.get('no_proxy'), '127.0.0.1,localhost,0.0.0.0']))
 
     cmd = [
         sys.executable,
         '-m',
         'vllm_gaudi.entrypoints.openai.multi_model_api_server',
         '--host',
-        api_host,
+        server_host,
         '--port',
         str(api_port),
         '--max-num-batched-tokens',
@@ -156,7 +176,7 @@ def run_server(config_path: str, api_host: str, api_port: int, log_capture: Serv
 
     print(f"\n>>> Starting server: {' '.join(cmd)}")
     print(f"    Config: {config_path}")
-    print(f"    Listening on {api_host}:{api_port}")
+    print(f"    Listening on {server_host}:{api_port}")
 
     proc = subprocess.Popen(
         cmd,
@@ -184,30 +204,38 @@ def run_server(config_path: str, api_host: str, api_port: int, log_capture: Serv
     return proc, log_thread
 
 
-def wait_for_server(api_host: str, api_port: int, timeout: int = 300) -> list[str]:
+def wait_for_server(api_host: str,
+                    api_port: int,
+                    timeout: int = 300,
+                    proc: subprocess.Popen | None = None) -> list[str]:
     """Wait for server to be ready and return list of available models."""
-    url = f"http://{api_host}:{api_port}/v1/models"
+    url = _api_url(api_host, api_port, '/v1/models')
     start = time.time()
+    last_error = None
 
     while time.time() - start < timeout:
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(f"Server exited before readiness check succeeded (exit code {proc.returncode})")
         try:
-            resp = requests.get(url, timeout=5)
+            resp = _HTTP_SESSION.get(url, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
                 models = [m.get('id') for m in data.get('data', [])]
                 print("  ✓ Server is ready")
                 print(f"  Available models: {models}")
                 return models
-        except Exception:
-            pass
+            last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
+        except Exception as e:
+            last_error = str(e)
         time.sleep(2)
 
-    raise RuntimeError(f"Server did not start after {timeout}s")
+    suffix = f" Last error: {last_error}" if last_error else ""
+    raise RuntimeError(f"Server did not start after {timeout}s.{suffix}")
 
 
 async def switch_model(api_host: str, api_port: int, model_name: str, drain_timeout: int = 60) -> dict:
     """Call /v1/models/switch endpoint and return metrics."""
-    url = f"http://{api_host}:{api_port}/v1/models/switch"
+    url = _api_url(api_host, api_port, '/v1/models/switch')
     payload = {
         "model": model_name,
         "drain_timeout": drain_timeout,
@@ -215,7 +243,7 @@ async def switch_model(api_host: str, api_port: int, model_name: str, drain_time
 
     start = time.perf_counter()
     try:
-        resp = requests.post(url, json=payload, timeout=600)
+        resp = _HTTP_SESSION.post(url, json=payload, timeout=600)
         elapsed_s = time.perf_counter() - start
 
         if resp.status_code == 200:
@@ -250,7 +278,7 @@ async def generate(api_host: str,
                    max_tokens: int = 1600,
                    strict_tokens: bool = True) -> dict:
     """Call /v1/chat/completions and return metrics."""
-    url = f"http://{api_host}:{api_port}/v1/chat/completions"
+    url = _api_url(api_host, api_port, '/v1/chat/completions')
     payload = {
         "model": model_name,
         "messages": [{
@@ -267,7 +295,7 @@ async def generate(api_host: str,
 
     start = time.perf_counter()
     try:
-        resp = requests.post(url, json=payload, timeout=120)
+        resp = _HTTP_SESSION.post(url, json=payload, timeout=120)
         elapsed_s = time.perf_counter() - start
 
         if resp.status_code == 200:
@@ -284,7 +312,7 @@ async def generate(api_host: str,
             if strict_tokens and resp.status_code == 400:
                 payload.pop("min_tokens", None)
                 payload.pop("ignore_eos", None)
-                retry_resp = requests.post(url, json=payload, timeout=120)
+                retry_resp = _HTTP_SESSION.post(url, json=payload, timeout=120)
                 retry_elapsed_s = time.perf_counter() - start
                 if retry_resp.status_code == 200:
                     data = retry_resp.json()
@@ -377,7 +405,7 @@ async def main():
                         help="Align with offline baseline (default 8192)")
     parser.add_argument("--phases", type=int, default=5)
     parser.add_argument("--fixed-output-tokens", type=int, default=1600, help="Target completion tokens per request")
-    parser.add_argument("--api-host", type=str, default="localhost")
+    parser.add_argument("--api-host", type=str, default="127.0.0.1")
     parser.add_argument("--api-port", type=int, default=None)
     args = parser.parse_args()
 
@@ -420,7 +448,7 @@ async def main():
             log_capture,
             args.max_num_batched_tokens,
         )
-        available_models = wait_for_server(args.api_host, args.api_port)
+        available_models = wait_for_server(args.api_host, args.api_port, proc=proc)
 
         if len(available_models) < 2:
             raise RuntimeError(f"Expected at least 2 models, got {len(available_models)}: {available_models}")
