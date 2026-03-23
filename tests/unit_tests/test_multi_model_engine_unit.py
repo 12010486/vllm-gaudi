@@ -97,7 +97,8 @@ async def test_initialize_and_switch_reconfigures_engine(mock_engine):
         "qwen": _FakeAsyncEngineArgs("Qwen/Qwen3-0.6B"),
     }
 
-    with patch("vllm_gaudi.v1.engine.multi_model_async_llm.AsyncLLM.from_engine_args", return_value=mock_engine):
+    with patch("vllm_gaudi.v1.engine.multi_model_async_llm.AsyncLLM.from_engine_args",
+               return_value=mock_engine), patch.object(MultiModelAsyncLLM, "_refresh_engine_frontend_config"):
         manager = MultiModelAsyncLLM(model_configs)
         await manager.initialize("llama")
         await manager.switch_model("qwen", drain_timeout=1)
