@@ -262,7 +262,13 @@ class MultiModelAsyncLLM:
                         timeout=drain_timeout + 5,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning("Drain timeout (%ss) exceeded. Proceeding with caution.", drain_timeout)
+                    logger.warning(
+                        "Drain timeout (%ss) exceeded; %s in-flight requests will be aborted "
+                        "by the reconfigure step (pause_scheduler mode='abort'). "
+                        "Clients whose requests are aborted will receive errors.",
+                        drain_timeout,
+                        model_name,
+                    )
                 finally:
                     drain_s = time.perf_counter() - drain_start
 
@@ -302,18 +308,29 @@ class MultiModelAsyncLLM:
             except Exception as e:
                 logger.error("Model switch failed during %s: %s. Attempting to restore engine state...",
                              e.__class__.__name__, e)
-                # Attempt recovery: wake up engine if it's stuck in sleep
+                # Attempt recovery: wake up weights/KV cache if stuck in sleep, then
+                # resume the scheduler (which may have been paused by gaudi_reconfigure_engine).
                 try:
                     logger.info("Attempting to wake up engine for recovery...")
                     await self._engine.wake_up(tags=["weights", "kv_cache"])
                     if self._current_model_name is not None:
                         self._sleeping[self._current_model_name] = False
                         logger.info("Model sleep state: %s=awake", self._current_model_name)
-                    logger.warning("Engine woken up. May still be in inconsistent state. "
-                                   "Manual restart recommended if issues persist.")
                 except Exception as recovery_error:
-                    logger.error("Recovery failed: %s: %s. Engine may be unresponsive. Manual server restart required.",
-                                 recovery_error.__class__.__name__, recovery_error)
+                    logger.error("Recovery wake_up failed: %s: %s", recovery_error.__class__.__name__, recovery_error)
+                # Always attempt to resume the scheduler to avoid a permanently paused state.
+                try:
+                    await self._engine.resume_generation()
+                    logger.warning("Engine recovered (wake_up + resume_generation). "
+                                   "State may still be inconsistent — manual restart recommended "
+                                   "if subsequent requests fail.")
+                except Exception as resume_error:
+                    logger.error(
+                        "Recovery resume_generation failed: %s: %s. "
+                        "Engine scheduler may be permanently paused. Manual server restart required.",
+                        resume_error.__class__.__name__,
+                        resume_error,
+                    )
 
                 # Re-raise original exception with context
                 raise RuntimeError(

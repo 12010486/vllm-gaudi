@@ -124,6 +124,20 @@ def install_engine_core_patch() -> None:
 
         # Unload model put to sleep, reload new model on worker
         unload_result = self.collective_rpc("unload_model")
+        # Validate unload_result: collective_rpc returns a list of per-worker results.
+        if not isinstance(unload_result, (list, tuple)) or len(unload_result) == 0:
+            logger.warning(
+                "[gaudi_reconfigure] unexpected unload_model result type: %s (expected non-empty list)",
+                type(unload_result).__name__,
+            )
+        else:
+            for i, worker_result in enumerate(unload_result):
+                if not isinstance(worker_result, dict):
+                    logger.warning(
+                        "[gaudi_reconfigure] worker %d returned non-dict from unload_model: %s",
+                        i,
+                        type(worker_result).__name__,
+                    )
         memory_after_unload_mb = _collect_total_hpu_used_memory_mb(self)
         self.collective_rpc("load_model", kwargs={"vllm_config": new_config})
         logger.info("[gaudi_reconfigure] worker model reload complete")
