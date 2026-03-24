@@ -48,28 +48,41 @@ SEED_PROMPTS = [
     "The president of the United States is",
     "The capital of France is",
     "The future of AI is",
-    "Explain quantum computing",
-    "The tallest mountain is",
-    "Write a short poem about",
-    "The speed of light is",
-    "Technology in 2050 will be",
-    "The most important invention",
+    "Explain quantum computing in simple terms:",
+    "The tallest mountain in the world is",
+    "Write a short poem about the ocean:",
+    "The speed of light is approximately",
+    "In the year 2050, technology will",
+    "The most important invention in history is",
+    "Describe the process of photosynthesis:",
+    "The largest ocean on Earth is",
+    "Artificial intelligence can help with",
+    "The first person to walk on the moon was",
+    "Climate change affects our planet by",
+    "The meaning of life according to philosophy is",
+    "Python programming is useful because",
+    "The human brain contains approximately",
+    "Renewable energy sources include",
+    "The history of the internet began with",
 ]
 
 
-def generate_prompts(n=20):
-    """Generate n prompts by cycling through seed prompts."""
+def generate_prompts(n=100):
+    """Generate n prompts by cycling through seed prompts with variations."""
     prompts = []
     for i in range(n):
         base = SEED_PROMPTS[i % len(SEED_PROMPTS)]
         if i < len(SEED_PROMPTS):
             prompts.append(base)
         else:
-            prompts.append(f"{base} (iteration {i // len(SEED_PROMPTS)})")
+            prompts.append(f"{base} (variation {i // len(SEED_PROMPTS)})")
     return prompts
 
 
 PROMPTS = generate_prompts(20)
+
+# Fixed token budget for accuracy checks.
+ACCURACY_MAX_TOKENS = 128
 
 
 def _server_api_host(api_host: str) -> str:
@@ -254,6 +267,124 @@ def wait_for_server(api_host: str,
 
     suffix = f" Last error: {last_error}" if last_error else ""
     raise RuntimeError(f"Server did not start after {timeout}s.{suffix}")
+
+
+async def generate_text(
+    api_host: str,
+    api_port: int,
+    model_name: str,
+    prompt: str,
+    max_tokens: int = ACCURACY_MAX_TOKENS,
+    seed: int = 42,
+) -> str | None:
+    """Generate text and return the raw string output, or None on failure.
+
+    Uses temperature=0 and a fixed seed so results are deterministic:
+    a correctly loaded model must produce the exact same output on every call.
+    """
+    url = _api_url(api_host, api_port, '/v1/chat/completions')
+    payload = {
+        "model": model_name,
+        "messages": [{
+            "role": "user",
+            "content": prompt
+        }],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "seed": seed,
+    }
+    try:
+        resp = _HTTP_SESSION.post(url, json=payload, timeout=60)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get('choices', [{}])[0].get('message', {}).get('content', '')
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [accuracy] generate_text failed: {exc}")
+    return None
+
+
+async def generate_texts_for_prompts(
+    api_host: str,
+    api_port: int,
+    model_name: str,
+    prompts: list[str],
+    seed: int = 42,
+) -> list[str | None]:
+    """Generate outputs for all prompts; returns one output per prompt."""
+    outputs: list[str | None] = []
+    for prompt in prompts:
+        output = await generate_text(
+            api_host,
+            api_port,
+            model_name,
+            prompt,
+            max_tokens=ACCURACY_MAX_TOKENS,
+            seed=seed,
+        )
+        outputs.append(output)
+    return outputs
+
+
+def _wrap_text(text: str, width: int = 45) -> list[str]:
+    """Word-wrap text to at most `width` characters per line."""
+    words = text.split()
+    lines: list[str] = []
+    line: list[str] = []
+    current = 0
+    for word in words:
+        if line and current + 1 + len(word) > width:
+            lines.append(' '.join(line))
+            line = [word]
+            current = len(word)
+        else:
+            current += (1 if line else 0) + len(word)
+            line.append(word)
+    if line:
+        lines.append(' '.join(line))
+    return lines or [""]
+
+
+def _short(text: str | None, width: int) -> str:
+    """Shorten text for compact table display."""
+    if text is None:
+        return "<no output>"
+    stripped = " ".join(text.split())
+    if len(stripped) <= width:
+        return stripped
+    return stripped[:width - 3] + "..."
+
+
+def print_accuracy_comparison(
+    model_display_name: str,
+    prompts: list[str],
+    baseline_outputs: list[str | None],
+    current_outputs: list[str | None],
+) -> tuple[int, int]:
+    """Print compact visual comparison for all prompts and return (matched, total)."""
+    total = min(len(prompts), len(baseline_outputs), len(current_outputs))
+    matched = 0
+
+    print("\n  " + "-" * 118)
+    print(f"  ACCURACY CHECK · {_display_model_name(model_display_name, 55)}")
+    print(f"  {'#':>2}  {'Match':<5}  {'Prompt':<34}  {'Baseline':<36}  {'After switch':<36}")
+    print("  " + "-" * 118)
+
+    for idx in range(total):
+        prompt = prompts[idx]
+        baseline = baseline_outputs[idx]
+        current = current_outputs[idx]
+        same = (baseline or "").strip() == (current or "").strip()
+        if same:
+            matched += 1
+        marker = "✓" if same else "✗"
+        print(f"  {idx + 1:>2}  {marker:<5}  "
+              f"{_short(prompt, 34):<34}  "
+              f"{_short(baseline, 36):<36}  "
+              f"{_short(current, 36):<36}")
+
+    print("  " + "-" * 118)
+    print(f"  Result: {matched}/{total} prompts match exactly")
+    return matched, total
 
 
 async def switch_model(api_host: str, api_port: int, model_name: str, drain_timeout: int = 60) -> dict:
@@ -457,6 +588,9 @@ async def main():
     parser.add_argument("--fixed-output-tokens", type=int, default=1600, help="Target completion tokens per request")
     parser.add_argument("--api-host", type=str, default="127.0.0.1")
     parser.add_argument("--api-port", type=int, default=None)
+    parser.add_argument("--no-accuracy-check",
+                        action="store_true",
+                        help="Skip accuracy comparison between baseline and post-switch outputs")
     args = parser.parse_args()
 
     if args.api_port is None:
@@ -513,6 +647,9 @@ async def main():
             print(f"    - {model['id']} -> {model['display_name']}")
 
         all_metrics = []
+        # baseline_texts[model_id] = outputs for all prompts on first load.
+        baseline_texts: dict[str, list[str | None]] = {}
+        accuracy_stats: dict[str, tuple[int, int]] = {}
         test_start = time.time()
 
         for phase in range(1, args.phases + 1):
@@ -541,6 +678,15 @@ async def main():
                     'model': model_name,
                 }
                 warmup_s = None  # Phase 1 warmup not measured separately
+                # Capture baseline output on first load (no switch yet).
+                if not args.no_accuracy_check:
+                    print(f"  [accuracy] Capturing baseline for {model_display_name} on {len(PROMPTS)} prompts...")
+                    baseline_texts[model_name] = await generate_texts_for_prompts(
+                        args.api_host,
+                        args.api_port,
+                        model_name,
+                        PROMPTS,
+                    )
             else:
                 switch_result = await switch_model(args.api_host, args.api_port, model_name)
 
@@ -569,6 +715,33 @@ async def main():
                 stash_used_gb = _mb_to_gb(switch_result.get('stash_memory_after_mb'))
                 if stash_used_gb is not None:
                     print(f"  ✓ HPU memory still used after stashing: {stash_used_gb:.2f} GB")
+
+                # Accuracy check: compare post-switch output to baseline.
+                if not args.no_accuracy_check:
+                    if model_name not in baseline_texts:
+                        # First time seeing this model — establish its baseline now.
+                        print(f"  [accuracy] Capturing baseline for {model_display_name} "
+                              f"on {len(PROMPTS)} prompts...")
+                        baseline_texts[model_name] = await generate_texts_for_prompts(
+                            args.api_host,
+                            args.api_port,
+                            model_name,
+                            PROMPTS,
+                        )
+                    else:
+                        current_outputs = await generate_texts_for_prompts(
+                            args.api_host,
+                            args.api_port,
+                            model_name,
+                            PROMPTS,
+                        )
+                        matched, total = print_accuracy_comparison(
+                            model_display_name,
+                            PROMPTS,
+                            baseline_texts[model_name],
+                            current_outputs,
+                        )
+                        accuracy_stats[f"phase{phase}"] = (matched, total)
 
             # Generate
             print(f">>> Generating with model: {model_display_name}")
@@ -610,6 +783,16 @@ async def main():
         # Print summary
         print("\n" + "=" * 60)
         print("  METRICS SUMMARY")
+
+        # Print accuracy summary.
+        if not args.no_accuracy_check and accuracy_stats:
+            total_phases = len(accuracy_stats)
+            passed_phases = sum(1 for matched, total in accuracy_stats.values() if matched == total)
+            icon = "✓" if passed_phases == total_phases else "✗"
+            print(f"  {icon} Accuracy checks: {passed_phases}/{total_phases} phases fully matched")
+            for phase_key, (matched, total) in accuracy_stats.items():
+                mark = "✓" if matched == total else "✗"
+                print(f"      {mark} {phase_key}: {matched}/{total} prompts")
         print("=" * 60)
         print_metrics_table(all_metrics)
         print(f"\n  Total time: {total_time:.2f}s")
