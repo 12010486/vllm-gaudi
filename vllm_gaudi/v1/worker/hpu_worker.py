@@ -27,7 +27,8 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, set_random_seed)
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheSpec, KVCacheTensor,
+                                        MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm_gaudi.utils import is_fake_hpu
@@ -93,6 +94,32 @@ class HPUWorker(WorkerBase):
         self.model_sleeping = False
         self.kv_cache_sleeping = False
         self.kv_cache_config = None
+        self._model_runner_stash: dict[tuple[object, ...], HPUModelRunner] = {}
+
+    def _apply_vllm_config(self, vllm_config: VllmConfig) -> None:
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.lora_config = vllm_config.lora_config
+        self.load_config = vllm_config.load_config
+        self.parallel_config = vllm_config.parallel_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.device_config = vllm_config.device_config
+        self.speculative_config = vllm_config.speculative_config
+        self.observability_config = vllm_config.observability_config
+
+    def _runner_stash_key(self, vllm_config: VllmConfig) -> tuple[object, ...]:
+        compile_cfg = vllm_config.compilation_config
+        return (
+            vllm_config.model_config.model,
+            vllm_config.model_config.dtype,
+            vllm_config.model_config.enforce_eager,
+            vllm_config.model_config.max_model_len,
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.cache_config.block_size,
+            tuple(getattr(compile_cfg, "compile_ranges_endpoints", ()) or ()),
+            tuple(getattr(compile_cfg, "compile_sizes", ()) or ()),
+        )
 
     def init_profiler(self):
         """Initialize the profiler."""
@@ -141,7 +168,8 @@ class HPUWorker(WorkerBase):
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
         # Set random seed.
         set_random_seed(self.model_config.seed)
-        self.model_runner = HPUModelRunner(vllm_config=self.vllm_config, is_driver_worker=self.is_driver_worker)
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner = HPUModelRunner(vllm_config=self.vllm_config, is_driver_worker=self.is_driver_worker)
         self.init_profiler()
 
     def shutdown(self):
@@ -156,9 +184,102 @@ class HPUWorker(WorkerBase):
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
-    def load_model(self) -> None:
+    def _clear_model(self) -> None:
+        """Clear model runner without shutting down the worker."""
+        if hasattr(self, 'model_runner') and self.model_runner is not None:
+            if hasattr(self.model_runner, 'model') and self.model_runner.model is not None:
+                try:
+                    import torch as _torch
+                    for param in self.model_runner.model.parameters():
+                        param.data = _torch.empty(0)
+                except Exception as e:
+                    logger.warning("[HPUWorker] Error clearing model parameters: %s", e)
+                self.model_runner.model = None
+            self.model_runner = None
+
+        self.kv_cache_config = None
+        self.kv_cache_sleeping = False
+
+        gc.collect()
+        gc.collect()
+        # Return freed memory to OS (Linux)
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:
+            pass
+        try:
+            import torch
+            torch.hpu.synchronize()
+        except Exception:
+            pass
+
+    def unload_model(self) -> None:
+        """Stash the current HPUModelRunner (weights already on CPU from sleep)
+        so its compiled ModuleCacher graph dict survives across model switches.
+        On a subsequent load_model() for the same model the runner is restored
+        directly, skipping warmup_graphs entirely.
+        """
+        if hasattr(self, 'model_runner') and self.model_runner is not None:
+            runner_config = getattr(self.model_runner, "vllm_config", self.vllm_config)
+            stash_key = self._runner_stash_key(runner_config)
+            logger.info("[HPUWorker] Stashing runner for model: %s", runner_config.model_config.model)
+            self._model_runner_stash[stash_key] = self.model_runner
+            self.model_runner = None
+        self.kv_cache_config = None
+        self.kv_cache_sleeping = False
+        gc.collect()
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:
+            pass
+        try:
+            torch.hpu.synchronize()
+        except Exception:
+            pass
+
+    def load_model(
+        self,
+        vllm_config: Optional[VllmConfig] = None,
+    ) -> None:
+        """Load a model. If vllm_config is provided, update config and rebuild runner.
+
+        If a runner was previously stashed for this model (weights on CPU from
+        a prior sleep→unload cycle) it is restored directly and weights are
+        moved back to HPU, skipping the expensive warmup_graphs phase.
+        """
+        if vllm_config is not None:
+            self._apply_vllm_config(vllm_config)
+
+            stash_key = self._runner_stash_key(vllm_config)
+            if stash_key in self._model_runner_stash:
+                # Runner is alive with compiled graph cache intact;
+                # weights are on CPU — just move them back to HPU.
+                logger.info("[HPUWorker] Restoring stashed runner for model: %s", vllm_config.model_config.model)
+                self.model_runner = self._model_runner_stash.pop(stash_key)
+                restored_config = getattr(self.model_runner, "vllm_config", self.vllm_config)
+                self._apply_vllm_config(restored_config)
+                # wake_up(weights) checks self.model_sleeping; set it first.
+                self.model_sleeping = True
+                self.wake_up(tags=["weights"])
+                # model_sleeping is cleared by wake_up; kv_cache handled by
+                # _initialize_kv_caches called separately by gaudi_reconfigure.
+                self.kv_cache_sleeping = False
+                return
+
+            with set_current_vllm_config(vllm_config):
+                self.model_runner = HPUModelRunner(
+                    vllm_config=vllm_config,
+                    is_driver_worker=self.is_driver_worker,
+                )
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+
+        self.model_sleeping = False
+        self.kv_cache_sleeping = False
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -340,6 +461,7 @@ class HPUWorker(WorkerBase):
         with HabanaMemoryProfiler() as m:
             self.kv_cache_config = kv_cache_config
             self.model_runner.initialize_kv_cache(kv_cache_config)
+            self.kv_cache_sleeping = False
             torch.hpu.synchronize()
         if len(self.model_runner.kv_caches) > 0:
             msg = (f"Usable num_blocks: {kv_cache_config.num_blocks}, "
@@ -352,6 +474,38 @@ class HPUWorker(WorkerBase):
                f"took {m.get_summary_string()}")
         logger.info(msg)
         self.compile_or_warm_up_model()
+
+    def _rebuild_kv_cache_config_for_current_model(self, base_config: KVCacheConfig) -> KVCacheConfig:
+        """Rebuild KV cache config for the currently loaded model.
+
+        Keeps the original number of blocks but regenerates layer bindings/specs
+        from the active model runner to avoid stale layer-name mappings.
+        """
+        current_specs = self.model_runner.get_kv_cache_spec()
+        num_blocks = base_config.num_blocks
+
+        kv_cache_tensors: list[KVCacheTensor] = []
+        kv_cache_groups: list[KVCacheGroupSpec] = []
+        for layer_name, kv_spec in current_specs.items():
+            kv_cache_tensors.append(KVCacheTensor(
+                size=kv_spec.page_size_bytes * num_blocks,
+                shared_by=[layer_name],
+            ))
+            kv_cache_groups.append(KVCacheGroupSpec(
+                layer_names=[layer_name],
+                kv_cache_spec=kv_spec,
+            ))
+
+        logger.info(
+            "Rebuilt KV cache config for current model: %d layers, %d blocks",
+            len(kv_cache_groups),
+            num_blocks,
+        )
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+        )
 
     def compile_or_warm_up_model(self) -> float:
         # Don't run the warmup if the model is already warmed up
@@ -505,6 +659,7 @@ class HPUWorker(WorkerBase):
                 logger.warning("KV cache config is empty, skipping reinitializing KV cache")
             else:
                 with HabanaMemoryProfiler() as m:
+                    self.kv_cache_config = self._rebuild_kv_cache_config_for_current_model(self.kv_cache_config)
                     self.model_runner.initialize_kv_cache(self.kv_cache_config)
                     self.model_runner.defragmenter = OnlineDefragmenter(self.model_runner.kv_caches,
                                                                         self.model_runner.block_size)
@@ -540,3 +695,4 @@ def track_graph_compile(name: str):
     if gc.stats()[0][1] != 0:
         msg = f"[{name}] graph compilation detected: {gc.stats()}"
         logger.warning(msg)
+
