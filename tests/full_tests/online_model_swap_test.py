@@ -27,6 +27,7 @@ Usage:
 
 import argparse
 import asyncio
+import contextlib
 import os
 import re
 import socket
@@ -85,6 +86,18 @@ def _api_url(api_host: str, api_port: int, path: str) -> str:
     return f"http://{_client_api_host(api_host)}:{api_port}{path}"
 
 
+def _display_model_name(model_name: str, width: int = 38) -> str:
+    if len(model_name) <= width:
+        return model_name
+    return model_name[:width - 3] + "..."
+
+
+def _mb_to_gb(memory_mb: float | None) -> float | None:
+    if memory_mb is None:
+        return None
+    return memory_mb / 1024.0
+
+
 def find_free_port():
     """Find an available port to bind to."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -113,10 +126,9 @@ def create_multi_model_config(model_a, model_b, max_model_len=4096, max_num_batc
             },
         },
     }
-    tmpfile = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False)
-    yaml.dump(config, tmpfile, default_flow_style=False)
-    tmpfile.close()
-    return tmpfile.name
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as tmpfile:
+        yaml.dump(config, tmpfile, default_flow_style=False)
+        return tmpfile.name
 
 
 class ServerLogCapture:
@@ -207,7 +219,7 @@ def run_server(config_path: str, api_host: str, api_port: int, log_capture: Serv
 def wait_for_server(api_host: str,
                     api_port: int,
                     timeout: int = 300,
-                    proc: subprocess.Popen | None = None) -> list[str]:
+                    proc: subprocess.Popen | None = None) -> list[dict[str, str]]:
     """Wait for server to be ready and return list of available models."""
     url = _api_url(api_host, api_port, '/v1/models')
     start = time.time()
@@ -220,9 +232,20 @@ def wait_for_server(api_host: str,
             resp = _HTTP_SESSION.get(url, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
-                models = [m.get('id') for m in data.get('data', [])]
+                models = []
+                for model_card in data.get('data', []):
+                    model_id = model_card.get('id')
+                    if not model_id:
+                        continue
+                    model_root = model_card.get('root') or model_card.get('model_path') or model_id
+                    models.append({
+                        'id': model_id,
+                        'display_name': model_root,
+                    })
                 print("  ✓ Server is ready")
-                print(f"  Available models: {models}")
+                print("  Available models:")
+                for model in models:
+                    print(f"    - {model['id']} -> {model['display_name']}")
                 return models
             last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
         except Exception as e:
@@ -252,8 +275,13 @@ async def switch_model(api_host: str, api_port: int, model_name: str, drain_time
                 'status': 'ok',
                 'duration_s': elapsed_s,
                 'api_duration_ms': data.get('duration_ms', 0),
+                'reconfigure_ms': data.get('reconfigure_ms'),
                 'switched': data.get('switched', False),
                 'model': data.get('current_model'),
+                'memory_before_mb': data.get('memory_before_mb'),
+                'memory_after_mb': data.get('memory_after_mb'),
+                'freed_memory_mb': data.get('freed_memory_mb'),
+                'stash_memory_after_mb': data.get('stash_memory_after_mb'),
             }
         else:
             return {
@@ -341,37 +369,41 @@ async def generate(api_host: str,
 
 def print_metrics_table(all_metrics):
     """Print a summary table of per-phase metrics."""
-    hdr = (f"{'Phase':>5}  {'Model':<15}  "
-           f"{'API Call(s)':>11}  {'Gen(s)':>7}  "
-           f"{'Warmup(s)':>9}  "
-           f"{'Tokens':>7}")
+    hdr = (f"{'Phase':>5}  {'Model':<38}  "
+           f"{'Init/Switch(s)':>14}  {'Warmup(s)':>9}  "
+           f"{'Gen(s)':>7}  "
+           f"{'Tokens':>7}  "
+           f"{'Freed(GB)':>9}  "
+           f"{'StashUsed(GB)':>13}")
     sep = "-" * len(hdr)
     print(f"\n{sep}")
     print(hdr)
-    print(f"{'(includes':>5}  {'':15}  {'warmup on':>11}  {'':7}  "
-          f"{'(from':>9}  {'':7}")
-    print(f"{'switch)':>5}  {'':15}  {'server)':>11}  {'':7}  "
-          f"{'logs)':>9}  {'':7}")
     print(sep)
+
     for m in all_metrics:
         warmup_s = m.get('warmup_s', 'N/A')
-        if isinstance(warmup_s, (int, float)):
-            warmup_str = f"{warmup_s:>9.1f}"
-        else:
-            warmup_str = f"{str(warmup_s):>9}"
+        warmup_str = f"{warmup_s:>9.1f}" if isinstance(warmup_s, (int, float)) else f"{str(warmup_s):>9}"
+
+        freed_gb = _mb_to_gb(m.get('freed_memory_mb'))
+        freed_str = f"{freed_gb:>9.2f}" if isinstance(freed_gb, (int, float)) else f"{'N/A':>9}"
+
+        stash_used_gb = _mb_to_gb(m.get('stash_memory_after_mb'))
+        stash_used_str = f"{stash_used_gb:>13.2f}" if isinstance(stash_used_gb, (int, float)) else f"{'N/A':>13}"
 
         print(f"{m['phase']:>5}  "
-              f"{m['model']:<15}  "
-              f"{m['switch_s']:>11.1f}  "
-              f"{m['gen_s']:>7.2f}  "
+              f"{_display_model_name(m['model'], 38):<38}  "
+              f"{m['reconfigure_s']:>13.1f}  "
               f"{warmup_str}  "
-              f"{m['tokens']:>7}")
+              f"{m['gen_s']:>7.2f}  "
+              f"{m['tokens']:>7}  "
+              f"{freed_str}  "
+              f"{stash_used_str}")
     print(sep)
 
     n = len(all_metrics)
     if n > 0:
         avg = {
-            'switch_s': sum(m['switch_s'] for m in all_metrics) / n,
+            'reconfigure_s': sum(m['reconfigure_s'] for m in all_metrics) / n,
             'gen_s': sum(m['gen_s'] for m in all_metrics) / n,
             'tokens': sum(m['tokens'] for m in all_metrics) / n,
         }
@@ -382,11 +414,29 @@ def print_metrics_table(all_metrics):
         else:
             warmup_str = f"{'N/A':>9}"
 
-        print(f"{'AVG':>5}  {'':<15}  "
-              f"{avg['switch_s']:>11.1f}  "
-              f"{avg['gen_s']:>7.2f}  "
+        freed_gbs = [_mb_to_gb(m.get('freed_memory_mb')) for m in all_metrics]
+        freed_gbs = [value for value in freed_gbs if isinstance(value, (int, float))]
+        if freed_gbs:
+            avg_freed = sum(freed_gbs) / len(freed_gbs)
+            freed_str = f"{avg_freed:>9.2f}"
+        else:
+            freed_str = f"{'N/A':>9}"
+
+        stash_used_gbs = [_mb_to_gb(m.get('stash_memory_after_mb')) for m in all_metrics]
+        stash_used_gbs = [value for value in stash_used_gbs if isinstance(value, (int, float))]
+        if stash_used_gbs:
+            avg_stash_used = sum(stash_used_gbs) / len(stash_used_gbs)
+            stash_used_str = f"{avg_stash_used:>13.2f}"
+        else:
+            stash_used_str = f"{'N/A':>13}"
+
+        print(f"{'AVG':>5}  {'':<38}  "
+              f"{avg['reconfigure_s']:>13.1f}  "
               f"{warmup_str}  "
-              f"{avg['tokens']:>7.0f}")
+              f"{avg['gen_s']:>7.2f}  "
+              f"{avg['tokens']:>7.0f}  "
+              f"{freed_str}  "
+              f"{stash_used_str}")
         print(sep)
 
 
@@ -441,6 +491,7 @@ async def main():
 
     try:
         # Start server
+        startup_begin = time.perf_counter()
         proc, log_thread = run_server(
             config_path,
             args.api_host,
@@ -449,36 +500,43 @@ async def main():
             args.max_num_batched_tokens,
         )
         available_models = wait_for_server(args.api_host, args.api_port, proc=proc)
+        initial_load_s = time.perf_counter() - startup_begin
+        startup_warmup_times = log_capture.get_warmup_times()
+        startup_warmup_s = startup_warmup_times[-1] if startup_warmup_times else None
 
         if len(available_models) < 2:
             raise RuntimeError(f"Expected at least 2 models, got {len(available_models)}: {available_models}")
 
         models = available_models[:2]  # Use first two available models
-        print(f"  Using models for test: {models}")
+        print("  Using models for test:")
+        for model in models:
+            print(f"    - {model['id']} -> {model['display_name']}")
 
         all_metrics = []
         test_start = time.time()
 
         for phase in range(1, args.phases + 1):
             model_idx = (phase - 1) % len(models)
-            model_name = models[model_idx]
-            model_label = chr(65 + model_idx)  # 'A', 'B', etc.
+            model_info = models[model_idx]
+            model_name = model_info['id']
+            model_display_name = model_info['display_name']
 
             print("\n" + "=" * 60)
-            print(f"  PHASE {phase}/{args.phases}: Model {model_label}")
+            print(f"  PHASE {phase}/{args.phases}: {model_display_name}")
             print("=" * 60)
 
             # Clear previous warmup events before this phase
             log_capture.clear_warmup_events()
 
             # Switch model (only if not on first phase with default model)
-            print(f"\n>>> Switching to model: {model_name}")
+            print(f"\n>>> Switching to model: {model_display_name} ({model_name})")
 
             if phase == 1:
                 print("  (Skipping switch on first phase - model already loaded)")
                 switch_result = {
                     'status': 'ok',
                     'duration_s': 0,
+                    'reconfigure_ms': 0,
                     'switched': False,
                     'model': model_name,
                 }
@@ -490,7 +548,11 @@ async def main():
                     print(f"  ✗ Switch failed: {switch_result.get('error')}")
                     continue
 
-                print(f"  ✓ API call duration: {switch_result['duration_s']:.1f}s (includes warmup)")
+                reconfigure_ms = switch_result.get('reconfigure_ms')
+                if isinstance(reconfigure_ms, (int, float)):
+                    print(f"  ✓ Sleep+load(reconfigure) duration: {reconfigure_ms / 1000.0:.1f}s")
+                else:
+                    print(f"  ✓ Switch API duration: {switch_result['duration_s']:.1f}s")
 
                 # Extract warmup time from logs captured during switch
                 # Wait a bit for final logs to be captured
@@ -500,8 +562,16 @@ async def main():
                 if warmup_s is not None:
                     print(f"  ✓ Warmup time from logs: {warmup_s}s")
 
+                freed_gb = _mb_to_gb(switch_result.get('freed_memory_mb'))
+                if freed_gb is not None:
+                    print(f"  ✓ Freed HPU memory: {freed_gb:.2f} GB")
+
+                stash_used_gb = _mb_to_gb(switch_result.get('stash_memory_after_mb'))
+                if stash_used_gb is not None:
+                    print(f"  ✓ HPU memory still used after stashing: {stash_used_gb:.2f} GB")
+
             # Generate
-            print(f">>> Generating with model: {model_name}")
+            print(f">>> Generating with model: {model_display_name}")
             prompt = PROMPTS[(phase - 1) % len(PROMPTS)]
             gen_result = await generate(
                 args.api_host,
@@ -520,13 +590,19 @@ async def main():
             print(f"  ✓ Generated {gen_result['output_tokens']} tokens in {gen_result['duration_s']:.2f}s")
 
             phase_metrics = {
-                'phase': phase,
-                'model': model_name,
-                'switch_s': switch_result.get('duration_s', 0),
-                'gen_s': gen_result['duration_s'],
+                'phase': len(all_metrics) + 1,
+                'model': model_display_name,
+                'reconfigure_s': (switch_result.get('reconfigure_ms') or 0) / 1000.0,
                 'warmup_s': warmup_s,
+                'gen_s': gen_result['duration_s'],
                 'tokens': gen_result['output_tokens'],
             }
+            if phase == 1:
+                phase_metrics['reconfigure_s'] = initial_load_s
+                phase_metrics['warmup_s'] = startup_warmup_s
+            else:
+                phase_metrics['freed_memory_mb'] = switch_result.get('freed_memory_mb')
+                phase_metrics['stash_memory_after_mb'] = switch_result.get('stash_memory_after_mb')
             all_metrics.append(phase_metrics)
 
         total_time = time.time() - test_start
@@ -568,10 +644,8 @@ async def main():
 
         # Clean up temp config if we created it
         if args.config is None and config_path:
-            try:
+            with contextlib.suppress(Exception):
                 os.unlink(config_path)
-            except Exception:
-                pass
 
     return 0
 

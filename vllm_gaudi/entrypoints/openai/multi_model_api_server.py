@@ -253,6 +253,11 @@ class ModelSwitchResponse(BaseModel):
     current_model: str
     switched: bool
     duration_ms: float
+    reconfigure_ms: float | None = None
+    memory_before_mb: float | None = None
+    memory_after_mb: float | None = None
+    freed_memory_mb: float | None = None
+    stash_memory_after_mb: float | None = None
 
 
 def _env_truthy(value: str | None) -> bool:
@@ -442,10 +447,11 @@ def _attach_multi_model_router(app: FastAPI) -> None:
 
         start = time.perf_counter()
         previous_model = manager.current_model
-        await manager.switch_model(
+        switch_metrics = await manager.switch_model(
             request.model,
             drain_timeout=request.drain_timeout,
         )
+
         await _init_multi_model_state(
             engine_client,
             raw_request.app.state,
@@ -456,12 +462,38 @@ def _attach_multi_model_router(app: FastAPI) -> None:
             active_model_name=manager.current_model or request.model,
         )
         duration_ms = (time.perf_counter() - start) * 1000.0
+        reconfigure_ms = None
+        memory_before_mb = None
+        memory_after_mb = None
+        freed_mb = None
+        stash_memory_after_mb = None
+        if isinstance(switch_metrics, dict):
+            reconfigure_s = switch_metrics.get("reconfigure_s")
+            if isinstance(reconfigure_s, (int, float)):
+                reconfigure_ms = float(reconfigure_s) * 1000.0
+            raw_before_mb = switch_metrics.get("memory_before_mb")
+            raw_after_mb = switch_metrics.get("memory_after_mb")
+            raw_freed_mb = switch_metrics.get("freed_memory_mb")
+            raw_stash_after_mb = switch_metrics.get("stash_memory_after_mb")
+            if isinstance(raw_before_mb, (int, float)):
+                memory_before_mb = float(raw_before_mb)
+            if isinstance(raw_after_mb, (int, float)):
+                memory_after_mb = float(raw_after_mb)
+            if isinstance(raw_freed_mb, (int, float)):
+                freed_mb = float(raw_freed_mb)
+            if isinstance(raw_stash_after_mb, (int, float)):
+                stash_memory_after_mb = float(raw_stash_after_mb)
 
         return ModelSwitchResponse(
             previous_model=previous_model,
             current_model=manager.current_model or request.model,
             switched=previous_model != manager.current_model,
             duration_ms=duration_ms,
+            reconfigure_ms=reconfigure_ms,
+            memory_before_mb=memory_before_mb,
+            memory_after_mb=memory_after_mb,
+            freed_memory_mb=freed_mb,
+            stash_memory_after_mb=stash_memory_after_mb,
         )
 
     app.include_router(router)

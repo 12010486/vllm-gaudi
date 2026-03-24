@@ -20,6 +20,57 @@ from vllm.v1.structured_output import StructuredOutputManager
 logger = init_logger(__name__)
 
 
+def _collect_numeric_values(value: Any) -> list[float]:
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, dict):
+        values: list[float] = []
+        for item in value.values():
+            values.extend(_collect_numeric_values(item))
+        return values
+    if isinstance(value, (list, tuple)):
+        values: list[float] = []
+        for item in value:
+            values.extend(_collect_numeric_values(item))
+        return values
+    return []
+
+
+def _collect_total_hpu_used_memory_mb(engine_core: Any) -> float | None:
+    try:
+        rpc_result = engine_core.collective_rpc("get_hpu_used_memory_mb")
+    except Exception:
+        return None
+
+    values = _collect_numeric_values(rpc_result)
+    if not values:
+        return None
+    return sum(values)
+
+
+def _collect_named_numeric_values(value: Any, field_name: str) -> list[float]:
+    if isinstance(value, dict):
+        values: list[float] = []
+        if field_name in value and isinstance(value[field_name], (int, float)):
+            values.append(float(value[field_name]))
+        for item in value.values():
+            values.extend(_collect_named_numeric_values(item, field_name))
+        return values
+    if isinstance(value, (list, tuple)):
+        values: list[float] = []
+        for item in value:
+            values.extend(_collect_named_numeric_values(item, field_name))
+        return values
+    return []
+
+
+def _sum_named_numeric_values(value: Any, field_name: str) -> float | None:
+    values = _collect_named_numeric_values(value, field_name)
+    if not values:
+        return None
+    return sum(values)
+
+
 def _reset_executor_sleep_state(model_executor: Any) -> None:
     """Clear executor sleeping tags after successful reconfigure."""
     if not getattr(model_executor, "is_sleeping", False):
@@ -43,7 +94,7 @@ def install_engine_core_patch() -> None:
     if hasattr(EngineCore, "gaudi_reconfigure_engine"):
         return
 
-    def gaudi_reconfigure_engine(self: Any, vllm_config_bytes: bytes) -> None:
+    def gaudi_reconfigure_engine(self: Any, vllm_config_bytes: bytes) -> dict[str, float | None]:
         """Reconfigure EngineCore for a new model/config in-process.
 
         This rebuilds KV cache configs, scheduler, and related runtime state
@@ -52,6 +103,7 @@ def install_engine_core_patch() -> None:
         start = time.perf_counter()
         new_config = cloudpickle.loads(vllm_config_bytes)
         logger.info("[gaudi_reconfigure] start: target_model=%s", new_config.model_config.model)
+        memory_before_mb = _collect_total_hpu_used_memory_mb(self)
 
         # Pause scheduling and clear caches to avoid mixed state.
         try:
@@ -71,7 +123,8 @@ def install_engine_core_patch() -> None:
             logger.warning("Failed to sleep executor before reconfigure: %s", exc)
 
         # Unload model put to sleep, reload new model on worker
-        self.collective_rpc("unload_model")
+        unload_result = self.collective_rpc("unload_model")
+        memory_after_unload_mb = _collect_total_hpu_used_memory_mb(self)
         self.collective_rpc("load_model", kwargs={"vllm_config": new_config})
         logger.info("[gaudi_reconfigure] worker model reload complete")
 
@@ -154,5 +207,18 @@ def install_engine_core_patch() -> None:
         self.resume_scheduler()
         elapsed = time.perf_counter() - start
         logger.info("[gaudi_reconfigure] completed in %.2fs", elapsed)
+
+        freed_memory_mb = None
+        if memory_before_mb is not None and memory_after_unload_mb is not None:
+            freed_memory_mb = max(memory_before_mb - memory_after_unload_mb, 0.0)
+
+        stash_memory_after_mb = _sum_named_numeric_values(unload_result, "stash_memory_after_mb")
+
+        return {
+            "memory_before_mb": memory_before_mb,
+            "memory_after_mb": memory_after_unload_mb,
+            "freed_memory_mb": freed_memory_mb,
+            "stash_memory_after_mb": stash_memory_after_mb,
+        }
 
     EngineCore.gaudi_reconfigure_engine = gaudi_reconfigure_engine

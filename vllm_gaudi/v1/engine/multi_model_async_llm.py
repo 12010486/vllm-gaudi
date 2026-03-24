@@ -9,6 +9,7 @@ and focuses on core functionality: initialize -> generate -> switch -> generate.
 from typing import Optional
 from collections.abc import AsyncGenerator
 import asyncio
+import contextlib
 import cloudpickle
 import time
 from vllm.config import VllmConfig
@@ -147,10 +148,8 @@ class MultiModelAsyncLLM:
         engine.observability_config = target_config.observability_config
 
         if renderer := getattr(engine, "renderer", None):
-            try:
+            with contextlib.suppress(Exception):
                 renderer.shutdown()
-            except Exception:
-                pass
 
         engine.renderer = renderer = renderer_from_config(target_config)
         engine.io_processor = get_io_processor(
@@ -207,7 +206,7 @@ class MultiModelAsyncLLM:
         self,
         model_name: str,
         drain_timeout: int = 60,
-    ) -> None:
+    ) -> dict[str, float | bool]:
         """
         Switch to a different model with error recovery
 
@@ -230,6 +229,10 @@ class MultiModelAsyncLLM:
 
         """
         async with self._switching_lock:
+            switch_start = time.perf_counter()
+            drain_s = 0.0
+            reconfigure_s = 0.0
+
             if self._engine is None:
                 raise RuntimeError("Engine not initialized. Call initialize() first.")
 
@@ -238,7 +241,12 @@ class MultiModelAsyncLLM:
 
             if model_name == self._current_model_name:
                 logger.info("Model '%s' already loaded.", model_name)
-                return
+                return {
+                    "switched": False,
+                    "drain_s": 0.0,
+                    "reconfigure_s": 0.0,
+                    "switch_s": 0.0,
+                }
 
             new_model = self._vllm_configs[model_name].model_config.model
 
@@ -247,6 +255,7 @@ class MultiModelAsyncLLM:
             try:
                 # Step 1: Drain pending requests
                 logger.info("Draining pending requests...")
+                drain_start = time.perf_counter()
                 try:
                     await asyncio.wait_for(
                         self._engine.wait_for_requests_to_drain(drain_timeout),
@@ -254,19 +263,22 @@ class MultiModelAsyncLLM:
                     )
                 except asyncio.TimeoutError:
                     logger.warning("Drain timeout (%ss) exceeded. Proceeding with caution.", drain_timeout)
+                finally:
+                    drain_s = time.perf_counter() - drain_start
 
                 # Step 2: Reconfigure engine core and scheduler in-process
                 logger.info("Reconfiguring engine for: %s", model_name)
                 serialized_config = cloudpickle.dumps(self._vllm_configs[model_name])
                 reconfigure_start = time.perf_counter()
-                await self._engine.engine_core.call_utility_async(
+                reconfigure_result = await self._engine.engine_core.call_utility_async(
                     "gaudi_reconfigure_engine",
                     serialized_config,
                 )
+                reconfigure_s = time.perf_counter() - reconfigure_start
                 logger.info(
                     "[gaudi_reconfigure] caller complete: to=%s elapsed=%.2fs",
                     model_name,
-                    time.perf_counter() - reconfigure_start,
+                    reconfigure_s,
                 )
                 self._sleeping[self._current_model_name] = True
                 self._sleeping[model_name] = False
@@ -276,6 +288,16 @@ class MultiModelAsyncLLM:
                 self._current_model_name = model_name
                 self._refresh_engine_frontend_config(model_name)
                 logger.info("Successfully switched to: %s", new_model)
+
+                result: dict[str, float | bool | None] = {
+                    "switched": True,
+                    "drain_s": drain_s,
+                    "reconfigure_s": reconfigure_s,
+                    "switch_s": time.perf_counter() - switch_start,
+                }
+                if isinstance(reconfigure_result, dict):
+                    result.update(reconfigure_result)
+                return result
 
             except Exception as e:
                 logger.error("Model switch failed during %s: %s. Attempting to restore engine state...",

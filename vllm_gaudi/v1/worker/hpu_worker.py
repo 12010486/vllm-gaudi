@@ -215,31 +215,36 @@ class HPUWorker(WorkerBase):
         except Exception:
             pass
 
-    def unload_model(self) -> None:
+    def unload_model(self) -> dict[str, float | None]:
         """Stash the current HPUModelRunner (weights already on CPU from sleep)
         so its compiled ModuleCacher graph dict survives across model switches.
         On a subsequent load_model() for the same model the runner is restored
         directly, skipping warmup_graphs entirely.
         """
-        if hasattr(self, 'model_runner') and self.model_runner is not None:
-            runner_config = getattr(self.model_runner, "vllm_config", self.vllm_config)
-            stash_key = self._runner_stash_key(runner_config)
-            logger.info("[HPUWorker] Stashing runner for model: %s", runner_config.model_config.model)
-            self._model_runner_stash[stash_key] = self.model_runner
-            self.model_runner = None
-        self.kv_cache_config = None
-        self.kv_cache_sleeping = False
-        gc.collect()
-        try:
-            import ctypes
-            libc = ctypes.CDLL("libc.so.6")
-            libc.malloc_trim(0)
-        except Exception:
-            pass
-        try:
-            torch.hpu.synchronize()
-        except Exception:
-            pass
+        with HabanaMemoryProfiler() as m:
+            if hasattr(self, 'model_runner') and self.model_runner is not None:
+                runner_config = getattr(self.model_runner, "vllm_config", self.vllm_config)
+                stash_key = self._runner_stash_key(runner_config)
+                logger.info("[HPUWorker] Stashing runner for model: %s", runner_config.model_config.model)
+                self._model_runner_stash[stash_key] = self.model_runner
+                self.model_runner = None
+            self.kv_cache_config = None
+            self.kv_cache_sleeping = False
+            gc.collect()
+            with contextlib.suppress(Exception):
+                import ctypes
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            with contextlib.suppress(Exception):
+                torch.hpu.synchronize()
+        msg = f"Stashing model runner took {m.get_summary_string()}"
+        logger.info(msg)
+
+        memory_after_stash_mb = self.get_hpu_used_memory_mb()
+
+        return {
+            "stash_memory_after_mb": memory_after_stash_mb,
+        }
 
     def load_model(
         self,
@@ -578,6 +583,17 @@ class HPUWorker(WorkerBase):
         tp_rank = get_tp_group().rank_in_group
         return {tp_rank: metadata}
 
+    def get_hpu_used_memory_mb(self) -> float | None:
+        """Return currently used HPU memory in MB for this worker."""
+        if is_fake_hpu():
+            return None
+        try:
+            torch.hpu.synchronize()
+            free_bytes, total_bytes = torch.hpu.mem_get_info()
+            return (total_bytes - free_bytes) / (1024**2)
+        except Exception:
+            return None
+
     def sleep(self, level: int = 1) -> None:
         """Put the worker into sleep mode to reduce memory usage. Unlike GPU workers that use custom
         memory allocators, HPU workers use a simpler approach of moving model to CPU and clearing KV cache.
@@ -695,4 +711,3 @@ def track_graph_compile(name: str):
     if gc.stats()[0][1] != 0:
         msg = f"[{name}] graph compilation detected: {gc.stats()}"
         logger.warning(msg)
-
