@@ -1,13 +1,13 @@
 # Single-Process Model Swap (Online Quickstart)
 
-This quickstart shows an end-to-end online flow for serving multiple small models sequentially on the same Gaudi card, in one process.
+This quickstart shows an end-to-end online flow for serving multiple small models sequentially in one Gaudi server process, without restarting the API server between model changes.
 
 ## When to Use
 
 Use this mode when:
 
 - You need to switch model A → model B without server restart.
-- Your workload is sequential and model sizes fit the card budget.
+- Your workload is sequential and each model fits the available device budget when loaded.
 
 Do not use this mode as a replacement for multi-process or multi-node orchestration.
 
@@ -41,6 +41,12 @@ python -m vllm_gaudi.entrypoints.openai.multi_model_api_server \
   --port 8080
 ```
 
+Notes:
+
+- This entrypoint reads configured model aliases from `VLLM_HPU_MULTI_MODEL_CONFIG`.
+- `/v1/models` lists every configured alias, but generation requests are handled by the currently active model only.
+- `/v1/models/switch` is available only when `VLLM_SERVER_DEV_MODE=1`.
+
 ## Online Flow (Smoke Test)
 
 1) List available models:
@@ -61,6 +67,8 @@ curl -s http://localhost:8080/v1/chat/completions \
     "temperature": 0
   }' | jq
 ```
+
+The `model` field should match the active model. After a successful switch, use the new model alias in subsequent requests.
 
 1) Switch model in-process:
 

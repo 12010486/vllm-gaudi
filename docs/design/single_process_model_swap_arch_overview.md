@@ -1,12 +1,13 @@
 # Architecture Overview
 
-This document provides an overview of the vLLM-gaudi architecture integration to allow a single-process model swap. Original v1 vllm architecture is multi-process based, and described in `vllm/docs/design/arch_overview.md`. Only modifications are presented.
+This document summarizes the vLLM Gaudi additions used to support single-process model swap. The baseline V1 architecture is described in the upstream vLLM architecture documentation; only the Gaudi-specific delta is covered here.
 
 ## Entrypoints
 
-vLLM provides a number of entrypoints for interacting with the system. The standard one for online inference is `OpenAI API Server`. We increased the HTTP entrypoints compatible with OpenAI API in order to control the single process models swap feature.
+vLLM provides multiple entrypoints for interacting with the system. For online inference, the model-swap feature uses a dedicated OpenAI-compatible Gaudi server entrypoint.
 
 ### OpenAI-Compatible Gaudi API Server
+
 The server can be launched directly via:
 
 ```bash
@@ -16,17 +17,20 @@ export VLLM_HPU_MULTI_MODEL_CONFIG=/path/to/multi_models.yaml
 python -m vllm_gaudi.entrypoints.openai.multi_model_api_server
 ```
 
-That code can be found in [vllm_gaudi/entrypoints/openai/multi_model_api_server.py](../../vllm_gaudi/entrypoints/openai/multi_model_api_server.py).
+Implementation lives in [vllm_gaudi/entrypoints/openai/multi_model_api_server.py](../../vllm_gaudi/entrypoints/openai/multi_model_api_server.py).
 
 ## New / Modified Components
 
 | Component | Type | Role in Model Swap |
 |---|---|---|
 | `vllm_gaudi.v1.engine.MultiModelAsyncLLM` | New manager wrapper | Owns multi-model configs, serializes swap requests, drains in-flight requests, and triggers in-process reconfigure |
-| `install_engine_core_patch()` | Runtime patch installer | Injects `gaudi_reconfigure_engine()` into V1 `EngineCore` at load_general_plugins() time |
+| `MultiModelEngineClient` | Engine client adapter | Exposes the wrapped `AsyncLLM` through the standard server-facing `EngineClient` interface |
+| `MultiModelServingModels` | OpenAI model registry adapter | Lists all configured models in `/v1/models`, while keeping request validation aligned with the currently active model |
+| `install_engine_core_patch()` | Runtime patch installer | Injects `gaudi_reconfigure_engine()` into V1 `EngineCore` when `MultiModelAsyncLLM` is constructed |
 | `EngineCore.gaudi_reconfigure_engine()` | Added utility method (patched) | Performs in-place runtime rebuild: pause/sleep, worker reload, KV cache re-init, scheduler/state reconstruction, resume |
 | `HPUWorker.load_model()` | Extended worker load path | Reloads model runner/model with new config |
 | `HPUWorker._rebuild_kv_cache_config_for_current_model(...)` | New helper | Rebuilds KV cache layer mappings from current model spec to prevent stale block-table/layer mapping state |
+| `MultiModelAsyncLLM._refresh_engine_frontend_config()` | Frontend refresh step | Rebuilds frontend-side renderer and processors so request parsing/tokenization matches the newly active model |
 
 ## Control Plane Delta: Switch Flow
 
@@ -37,22 +41,24 @@ That code can be found in [vllm_gaudi/entrypoints/openai/multi_model_api_server.
 3. Drain pending requests (`wait_for_requests_to_drain`).
 4. Serialize target `VllmConfig` with `cloudpickle`.
 5. Invoke EngineCore utility: `call_utility_async("gaudi_reconfigure_engine", serialized_config)`.
-6. Update local model sleep-state bookkeeping and active model pointer.
+6. Refresh frontend-side `AsyncLLM` state (`renderer`, I/O processor, input processor, output processor).
+7. Update local model sleep-state bookkeeping and active model pointer.
 
 ### EngineCore side (`gaudi_reconfigure_engine`)
 
 1. Deserialize new config.
 2. Pause scheduler with cache reset (`pause_scheduler(mode="abort", clear_cache=True)`).
 3. Sleep executor at level 1 to release device memory pressure.
-4. Broadcast worker reload via collective RPC (`load_model`).
-5. Recompute and initialize KV cache (`_initialize_kv_caches`, `initialize_cache`).
-6. Rebuild scheduler-dependent runtime objects:
+4. Unload current worker model via collective RPC (`unload_model`).
+5. Broadcast worker reload via collective RPC (`load_model`).
+6. Recompute and initialize KV cache (`_initialize_kv_caches`, `initialize_cache`).
+7. Rebuild scheduler-dependent runtime objects:
    - `StructuredOutputManager`
    - scheduler instance
    - KV connector handshake metadata
    - multimodal receiver cache
    - request block hasher and batch queue helpers
-7. Resume scheduler.
+8. Reset executor sleep bookkeeping and resume scheduler.
 
 ## State Rebuild Delta
 
@@ -66,3 +72,10 @@ Rebuilt state includes:
 - multimodal receiver cache
 - request block hashing setup
 - queueing/execution helper state (`batch_queue`, `step_fn`, abort queue)
+- frontend-side renderer and request processors used by the OpenAI server
+
+## API Behavior Notes
+
+- `/v1/models` returns all configured model aliases from the multi-model YAML file.
+- Inference requests are still served by the currently active model only.
+- `/v1/models/switch` is exposed only when `VLLM_SERVER_DEV_MODE=1`.
