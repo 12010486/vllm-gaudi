@@ -183,37 +183,6 @@ class HPUWorker(WorkerBase):
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
-    def _clear_model(self) -> None:
-        """Clear model runner without shutting down the worker."""
-        if hasattr(self, 'model_runner') and self.model_runner is not None:
-            if hasattr(self.model_runner, 'model') and self.model_runner.model is not None:
-                try:
-                    import torch as _torch
-                    for param in self.model_runner.model.parameters():
-                        param.data = _torch.empty(0)
-                except Exception as e:
-                    logger.warning("[HPUWorker] Error clearing model parameters: %s", e)
-                self.model_runner.model = None
-            self.model_runner = None
-
-        self.kv_cache_config = None
-        self.kv_cache_sleeping = False
-
-        gc.collect()
-        gc.collect()
-        # Return freed memory to OS (Linux)
-        try:
-            import ctypes
-            libc = ctypes.CDLL("libc.so.6")
-            libc.malloc_trim(0)
-        except Exception:
-            pass
-        try:
-            import torch
-            torch.hpu.synchronize()
-        except Exception:
-            pass
-
     def unload_model(self) -> dict[str, float | None]:
         """Stash the current HPUModelRunner (weights already on CPU from sleep)
         so its compiled ModuleCacher graph dict survives across model switches.
