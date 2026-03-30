@@ -41,6 +41,12 @@ from vllm_gaudi.v1.engine.multi_model_async_llm import MultiModelAsyncLLM
 
 logger = init_logger("vllm_gaudi.entrypoints.openai.multi_model_api_server")
 
+_RESERVED_MODEL_ENV_KEYS = {
+    "VLLM_SERVER_DEV_MODE",
+    "VLLM_ALLOW_INSECURE_SERIALIZATION",
+    "VLLM_HPU_MULTI_MODEL_CONFIG",
+}
+
 
 class MultiModelEngineClient(EngineClient):
     """EngineClient adapter for MultiModelAsyncLLM."""
@@ -264,7 +270,64 @@ def _resolve_multi_model_config_path() -> str | None:
     return os.environ.get("VLLM_HPU_MULTI_MODEL_CONFIG")
 
 
-def _load_multi_model_config(path: str) -> tuple[dict[str, AsyncEngineArgs], str]:
+def _collect_declared_model_env_keys(model_env_vars: dict[str, dict[str, str]]) -> set[str]:
+    all_declared_keys: set[str] = set()
+    for env_map in model_env_vars.values():
+        all_declared_keys.update(env_map.keys())
+    return all_declared_keys
+
+
+def _capture_default_model_env_vars(model_env_vars: dict[str, dict[str, str]]) -> dict[str, str]:
+    """Capture baseline env values for keys used in per-model env mappings."""
+    default_env_vars: dict[str, str] = {}
+    for key in _collect_declared_model_env_keys(model_env_vars):
+        if key in os.environ:
+            default_env_vars[key] = os.environ[key]
+    return default_env_vars
+
+
+def _apply_model_env_vars(
+    model_name: str,
+    model_env_vars: dict[str, dict[str, str]],
+    default_env_vars: dict[str, str],
+) -> None:
+    """Apply the per-model environment variables declared in the YAML config.
+
+    Variables present in the mapping for *model_name* are written into
+    ``os.environ`` so that the engine (worker processes forked afterwards or
+    the current process in the case of in-process workers) picks them up.
+    Variables that were set by a *previous* model but are absent from the new
+    model's mapping are removed, so each model gets a clean slate.
+    """
+    # Collect all env-var keys that any model declares so we can clean up.
+    all_declared_keys = _collect_declared_model_env_keys(model_env_vars)
+
+    target_env = model_env_vars.get(model_name, {})
+
+    for key in all_declared_keys:
+        if key in target_env:
+            old_val = os.environ.get(key)
+            new_val = target_env[key]
+            if old_val != new_val:
+                logger.info("Setting env var %s=%r for model '%s' (was %r)", key, new_val, model_name, old_val)
+            os.environ[key] = new_val
+        else:
+            if key in default_env_vars:
+                default_val = default_env_vars[key]
+                old_val = os.environ.get(key)
+                if old_val != default_val:
+                    logger.info("Restoring env var %s=%r for model '%s' (was %r)", key, default_val, model_name,
+                                old_val)
+                os.environ[key] = default_val
+            elif key in os.environ:
+                logger.info("Removing env var %s for model '%s'", key, model_name)
+                del os.environ[key]
+
+    if target_env:
+        logger.info("Applied %d env var(s) for model '%s': %s", len(target_env), model_name, list(target_env.keys()))
+
+
+def _load_multi_model_config(path: str) -> tuple[dict[str, AsyncEngineArgs], str, dict[str, dict[str, str]]]:
     with open(path) as f:
         data = yaml.safe_load(f)
 
@@ -276,12 +339,23 @@ def _load_multi_model_config(path: str) -> tuple[dict[str, AsyncEngineArgs], str
         raise ValueError("Multi-model config requires a non-empty 'models' mapping.")
 
     model_configs: dict[str, AsyncEngineArgs] = {}
+    model_env_vars: dict[str, dict[str, str]] = {}
     for name, raw_cfg in raw_models.items():
         if not isinstance(raw_cfg, dict):
             raise ValueError(f"Model config for '{name}' must be a mapping.")
         if "model" not in raw_cfg:
             raise ValueError(f"Model config for '{name}' must include 'model'.")
         try:
+            raw_cfg = dict(raw_cfg)  # shallow copy to avoid mutating the parsed YAML
+            env_vars = raw_cfg.pop("env", None) or {}
+            if not isinstance(env_vars, dict):
+                raise ValueError(f"'env' for model '{name}' must be a key-value mapping.")
+            normalized_env_vars = {str(k): str(v) for k, v in env_vars.items()}
+            invalid_keys = sorted(set(normalized_env_vars).intersection(_RESERVED_MODEL_ENV_KEYS))
+            if invalid_keys:
+                raise ValueError(f"'env' for model '{name}' contains reserved key(s): {invalid_keys}. "
+                                 "These keys are controlled by server startup and cannot be overridden per model.")
+            model_env_vars[name] = normalized_env_vars
             model_configs[name] = AsyncEngineArgs(**raw_cfg)
         except TypeError as e:
             raise ValueError(f"Invalid config for '{name}': {e}") from e
@@ -293,7 +367,7 @@ def _load_multi_model_config(path: str) -> tuple[dict[str, AsyncEngineArgs], str
         raise ValueError(f"Default model '{default_model}' not found in config models: "
                          f"{list(model_configs.keys())}")
 
-    return model_configs, default_model
+    return model_configs, default_model, model_env_vars
 
 
 def _build_model_registry(manager: MultiModelAsyncLLM) -> tuple[dict[str, BaseModelPath], dict[str, int]]:
@@ -311,13 +385,19 @@ async def build_multi_model_engine_client(
     args: Namespace,
     *,
     usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,
-) -> AsyncIterator[tuple[MultiModelEngineClient, MultiModelAsyncLLM, dict[str, BaseModelPath], dict[str, int]]]:
+) -> AsyncIterator[tuple[MultiModelEngineClient, MultiModelAsyncLLM, dict[str, BaseModelPath], dict[str, int], dict[
+        str, dict[str, str]], dict[str, str]]]:
     config_path = _resolve_multi_model_config_path()
     if not config_path:
         raise ValueError("A multi-model config path must be set when multi-model mode is enabled. "
                          "Supported env var: VLLM_HPU_MULTI_MODEL_CONFIG.")
 
-    model_configs, default_model = _load_multi_model_config(config_path)
+    model_configs, default_model, model_env_vars = _load_multi_model_config(config_path)
+    default_env_vars = _capture_default_model_env_vars(model_env_vars)
+
+    # Apply env vars for the default (startup) model before initializing the engine.
+    _apply_model_env_vars(default_model, model_env_vars, default_env_vars)
+
     manager = MultiModelAsyncLLM(
         model_configs,
         usage_context=usage_context,
@@ -332,7 +412,7 @@ async def build_multi_model_engine_client(
     all_model_paths, model_max_lens = _build_model_registry(manager)
 
     try:
-        yield engine_client, manager, all_model_paths, model_max_lens
+        yield engine_client, manager, all_model_paths, model_max_lens, model_env_vars, default_env_vars
     finally:
         manager.shutdown()
 
@@ -433,6 +513,8 @@ def _attach_multi_model_router(app: FastAPI) -> None:
         engine_client: EngineClient = raw_request.app.state.multi_model_engine_client
         all_model_paths = raw_request.app.state.multi_model_all_model_paths
         model_max_lens = raw_request.app.state.multi_model_max_lens
+        model_env_vars: dict[str, dict[str, str]] = getattr(raw_request.app.state, "multi_model_env_vars", {})
+        default_env_vars: dict[str, str] = getattr(raw_request.app.state, "multi_model_default_env_vars", {})
         args = raw_request.app.state.args
         supported_tasks = raw_request.app.state.supported_tasks
 
@@ -441,6 +523,8 @@ def _attach_multi_model_router(app: FastAPI) -> None:
 
         start = time.perf_counter()
         previous_model = manager.current_model
+        # Apply the target model's env vars *before* the engine reconfigures.
+        _apply_model_env_vars(request.model, model_env_vars, default_env_vars)
         switch_metrics = await manager.switch_model(
             request.model,
             drain_timeout=request.drain_timeout,
@@ -514,6 +598,8 @@ async def _run_multi_model_server_worker(
             manager,
             all_model_paths,
             model_max_lens,
+            model_env_vars,
+            default_env_vars,
     ):
         supported_tasks = await engine_client.get_supported_tasks()
         logger.info("Supported tasks: %s", supported_tasks)
@@ -523,6 +609,8 @@ async def _run_multi_model_server_worker(
         app.state.multi_model_engine_client = engine_client
         app.state.multi_model_all_model_paths = all_model_paths
         app.state.multi_model_max_lens = model_max_lens
+        app.state.multi_model_env_vars = model_env_vars
+        app.state.multi_model_default_env_vars = default_env_vars
         app.state.supported_tasks = supported_tasks
         app.state.args = args
 

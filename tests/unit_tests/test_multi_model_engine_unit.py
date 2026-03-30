@@ -66,10 +66,11 @@ def test_load_multi_model_config_success(tmp_path):
         }))
 
     with patch.object(api_server, "AsyncEngineArgs", _FakeAsyncEngineArgs):
-        model_configs, default_model = api_server._load_multi_model_config(str(cfg_path))
+        model_configs, default_model, model_env_vars = api_server._load_multi_model_config(str(cfg_path))
 
     assert default_model == "llama"
     assert set(model_configs.keys()) == {"llama", "qwen"}
+    assert model_env_vars == {"llama": {}, "qwen": {}}
 
 
 def test_load_multi_model_config_falls_back_to_model_env(tmp_path, monkeypatch):
@@ -88,9 +89,112 @@ def test_load_multi_model_config_falls_back_to_model_env(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL", "qwen")
 
     with patch.object(api_server, "AsyncEngineArgs", _FakeAsyncEngineArgs):
-        _, default_model = api_server._load_multi_model_config(str(cfg_path))
+        _, default_model, _ = api_server._load_multi_model_config(str(cfg_path))
 
     assert default_model == "qwen"
+
+
+def test_load_multi_model_config_env_vars_parsed(tmp_path):
+    """env: key is extracted from the model config and not passed to AsyncEngineArgs."""
+    cfg_path = tmp_path / "multi.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump({
+            "default_model": "llama",
+            "models": {
+                "llama": {
+                    "model": "meta-llama/Llama-3.1-8B-Instruct",
+                    "env": {
+                        "QUANT_CONFIG": "/path/to/quant.json",
+                        "VLLM_SKIP_WARMUP": "true",
+                    },
+                },
+                "qwen": {
+                    "model": "Qwen/Qwen3-0.6B",
+                    # no env key
+                },
+            },
+        }))
+
+    with patch.object(api_server, "AsyncEngineArgs", _FakeAsyncEngineArgs):
+        model_configs, default_model, model_env_vars = api_server._load_multi_model_config(str(cfg_path))
+
+    assert default_model == "llama"
+    assert model_env_vars["llama"] == {
+        "QUANT_CONFIG": "/path/to/quant.json",
+        "VLLM_SKIP_WARMUP": "true",
+    }
+    assert model_env_vars["qwen"] == {}
+    # Ensure env key was stripped before AsyncEngineArgs was called.
+    # _FakeAsyncEngineArgs would have raised TypeError if 'env' were passed through.
+    assert set(model_configs.keys()) == {"llama", "qwen"}
+
+
+def test_load_multi_model_config_rejects_reserved_env_keys(tmp_path):
+    cfg_path = tmp_path / "multi.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump({
+            "models": {
+                "llama": {
+                    "model": "meta-llama/Llama-3.1-8B-Instruct",
+                    "env": {
+                        "VLLM_SERVER_DEV_MODE": "0",
+                    },
+                },
+            },
+        }))
+
+    with patch.object(api_server, "AsyncEngineArgs", _FakeAsyncEngineArgs) and pytest.raises(ValueError,
+                                                                                             match="reserved key"):
+        api_server._load_multi_model_config(str(cfg_path))
+
+
+def test_apply_model_env_vars_sets_and_cleans(monkeypatch):
+    """_apply_model_env_vars sets new vars and removes vars from the previous model."""
+    model_env_vars = {
+        "llama": {
+            "QUANT_CONFIG": "/quant_llama.json",
+            "VLLM_SKIP_WARMUP": "false"
+        },
+        "qwen": {
+            "QUANT_CONFIG": "/quant_qwen.json"
+        },
+    }
+    default_env_vars = {"VLLM_SKIP_WARMUP": "true"}
+
+    # Apply llama env vars.
+    api_server._apply_model_env_vars("llama", model_env_vars, default_env_vars)
+    import os
+    assert os.environ["QUANT_CONFIG"] == "/quant_llama.json"
+    assert os.environ["VLLM_SKIP_WARMUP"] == "false"
+
+    # Switch to qwen: QUANT_CONFIG should update; VLLM_SKIP_WARMUP should restore default.
+    api_server._apply_model_env_vars("qwen", model_env_vars, default_env_vars)
+    assert os.environ["QUANT_CONFIG"] == "/quant_qwen.json"
+    assert os.environ["VLLM_SKIP_WARMUP"] == "true"
+
+    # Clean up to avoid polluting other tests.
+    monkeypatch.delenv("QUANT_CONFIG", raising=False)
+    monkeypatch.delenv("VLLM_SKIP_WARMUP", raising=False)
+
+
+def test_capture_default_model_env_vars(monkeypatch):
+    model_env_vars = {
+        "a": {
+            "EXISTING_KEY": "override",
+            "MISSING_KEY": "x"
+        },
+        "b": {
+            "OTHER_KEY": "y"
+        },
+    }
+    monkeypatch.setenv("EXISTING_KEY", "base")
+    monkeypatch.setenv("OTHER_KEY", "original")
+
+    defaults = api_server._capture_default_model_env_vars(model_env_vars)
+    assert defaults == {
+        "EXISTING_KEY": "base",
+        "OTHER_KEY": "original",
+    }
 
 
 @pytest.mark.asyncio
