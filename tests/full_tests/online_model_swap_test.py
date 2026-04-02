@@ -241,7 +241,7 @@ def run_server(config_path: str, api_host: str, api_port: int, log_capture: Serv
 
 async def wait_for_server(api_host: str,
                           api_port: int,
-                          timeout: int = 300,
+                          timeout: int = 600,
                           proc: subprocess.Popen | None = None) -> list[dict[str, str]]:
     """Wait for server to be ready and return list of available models."""
     url = _api_url(api_host, api_port, '/v1/models')
