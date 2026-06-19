@@ -89,6 +89,10 @@ class HPUWorker(WorkerBase):
         self.kv_cache_config = None
         self._model_runner_stash: dict[tuple[object, ...], HPUModelRunner] = {}
         self._model_runner_state_stash: dict[tuple[object, ...], dict[str, Any]] = {}
+        # Set during stash-restore to cap determine_available_memory() at the
+        # original warmup block count, keeping KV-cache tensor shapes stable
+        # across reconfigures and avoiding HPU recipe recompilation.
+        self._cap_kv_blocks: int | None = None
 
     def _apply_vllm_config(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
@@ -253,6 +257,18 @@ class HPUWorker(WorkerBase):
             if stash_key in self._model_runner_stash:
                 # Runner is alive with compiled graph cache intact;
                 # weights are on CPU — just move them back to HPU.
+                # Capture the warmup block count BEFORE restore overwrites
+                # kv_cache_config so we can cap the new allocation to the
+                # same shape that all compiled HPU recipes expect.
+                stashed_state = self._model_runner_state_stash.get(stash_key, {})
+                original_kv_cfg = stashed_state.get("kv_cache_config")
+                if original_kv_cfg is not None and hasattr(original_kv_cfg, "num_blocks"):
+                    self._cap_kv_blocks = int(original_kv_cfg.num_blocks)
+                    logger.info(
+                        "[HPUWorker] Capping KV cache to warmup block count: %d "
+                        "(prevents HPU recipe recompilation on shape change)",
+                        self._cap_kv_blocks,
+                    )
                 self.restore_stashed_model(vllm_config=vllm_config, restore_kv_cache=False)
                 self.kv_cache_sleeping = False
                 return {
@@ -445,6 +461,24 @@ class HPUWorker(WorkerBase):
         gc.collect()
         available = cache_size_bytes - dummy_block_headroom
 
+        # If a warmup block-count cap was set (stash-restore path), clamp the
+        # available bytes so _initialize_kv_caches allocates the SAME number
+        # of blocks as the original warmup.  Compiled HPU recipes are
+        # shape-specialised on the KV-cache tensor dim-0; a different block
+        # count causes shape-guard failures and full runtime recompilation of
+        # every bucket graph
+        if self._cap_kv_blocks is not None:
+            cap_bytes = self._cap_kv_blocks * single_kv_block_size_bytes
+            if available > cap_bytes:
+                logger.info(
+                    "[HPUWorker] Clamping available KV memory from %s to %s "
+                    "(%d blocks) to preserve warmup tensor shape.",
+                    format_bytes(available),
+                    format_bytes(cap_bytes),
+                    self._cap_kv_blocks,
+                )
+                available = cap_bytes
+
         # For hybrid models (attention + recurrent layers), the GPU
         # backend shares a single raw buffer across spec types via
         # as_strided, but HPU allocates separate tensors per spec
@@ -510,6 +544,39 @@ class HPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+        # ----------------------------------------------------------------
+        # Stash-restore shape stability check.
+        #
+        # HPU compiled recipes are shape-specialised on kv_cache dim-0
+        # (num_blocks).  If the reconfigure path yields a different block
+        # count than the warmup (because the stashed model's compiled
+        # graphs occupy HPU memory, leaving fewer free bytes), the cached
+        # recipes are invalid for the new shape.  
+        #
+        # When _cap_kv_blocks is set we are on the stash-restore path and
+        # know the original warmup block count.  If the new allocation
+        # differs, invalidate graphed_buckets so compile_or_warm_up_model()
+        # re-runs warmup_model() for the new shape.  The overhead is paid
+        # only once per model: the next stash-restore of the same model
+        # will find the stash already stores the new block count and skip
+        # re-warmup.
+        if self._cap_kv_blocks is not None and self.model_runner is not None:
+            new_blocks = kv_cache_config.num_blocks
+            if new_blocks != self._cap_kv_blocks:
+                logger.warning(
+                    "[HPUWorker] KV cache block count changed from warmup "
+                    "value %d to %d (likely due to cross-model graph memory "
+                    "occupying HPU during reconfigure).  Invalidating "
+                    "graphed_buckets to trigger re-warmup for the new shape.",
+                    self._cap_kv_blocks,
+                    new_blocks,
+                )
+                # Clear the set; compile_or_warm_up_model() checks
+                # `if not graphed_buckets` and will call warmup_model().
+                self.model_runner.graphed_buckets = set()  # type: ignore[union-attr]
+
+        # Cap has been applied / check is done; clear it now.
+        self._cap_kv_blocks = None
 
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.
