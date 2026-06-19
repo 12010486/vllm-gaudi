@@ -523,6 +523,10 @@ async def switch_model(api_host: str, api_port: int, model_name: str, drain_time
                 'memory_after_unload_mb': data.get('memory_after_unload_mb'),
                 'freed_memory_mb': data.get('freed_memory_mb'),
                 'stash_memory_after_mb': data.get('stash_memory_after_mb'),
+                'restored_from_stash': data.get('restored_from_stash'),
+                'restored_from_stash_workers': data.get('restored_from_stash_workers'),
+                'cold_load_workers': data.get('cold_load_workers'),
+                'num_gpu_blocks': data.get('num_gpu_blocks'),
             }
         else:
             return {
@@ -890,8 +894,24 @@ async def main():
                 if stash_used_gb is not None:
                     print(f"  ✓ HPU memory still used after stashing: {stash_used_gb:.2f} GB")
 
+                restored_from_stash = switch_result.get('restored_from_stash')
+                if isinstance(restored_from_stash, bool):
+                    restore_mode = 'stash-restore' if restored_from_stash else 'cold-load'
+                    restored_workers = switch_result.get('restored_from_stash_workers')
+                    cold_workers = switch_result.get('cold_load_workers')
+                    print(f"  ✓ Reload path: {restore_mode} "
+                          f"(restored_workers={restored_workers}, cold_workers={cold_workers})")
+
+                num_gpu_blocks = switch_result.get('num_gpu_blocks')
+                if isinstance(num_gpu_blocks, int):
+                    print(f"  ✓ KV cache num_gpu_blocks: {num_gpu_blocks}")
+
                 phase_metrics['freed_memory_mb'] = switch_result.get('freed_memory_mb')
                 phase_metrics['stash_memory_after_mb'] = switch_result.get('stash_memory_after_mb')
+                phase_metrics['restored_from_stash'] = switch_result.get('restored_from_stash')
+                phase_metrics['restored_from_stash_workers'] = switch_result.get('restored_from_stash_workers')
+                phase_metrics['cold_load_workers'] = switch_result.get('cold_load_workers')
+                phase_metrics['num_gpu_blocks'] = switch_result.get('num_gpu_blocks')
 
                 # Accuracy check: compare post-switch output to baseline.
                 if not args.no_accuracy_check:

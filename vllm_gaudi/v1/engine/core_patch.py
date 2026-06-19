@@ -76,6 +76,19 @@ def _sum_named_numeric_values(value: Any, field_name: str) -> float | None:
     return sum(values)
 
 
+def _count_named_boolean_values(value: Any, field_name: str, expected: bool) -> int:
+    if isinstance(value, dict):
+        count = 0
+        if value.get(field_name) is expected:
+            count += 1
+        for item in value.values():
+            count += _count_named_boolean_values(item, field_name, expected)
+        return count
+    if isinstance(value, (list, tuple)):
+        return sum(_count_named_boolean_values(item, field_name, expected) for item in value)
+    return 0
+
+
 def _reset_executor_sleep_state(model_executor: Any) -> None:
     """Clear executor sleeping tags after successful reconfigure."""
     if not getattr(model_executor, "is_sleeping", False):
@@ -235,6 +248,7 @@ def install_engine_core_patch() -> None:
         new_config = _deserialize_reconfigure_config(vllm_config_bytes)
         memory_before_mb = None
         unload_result = None
+        load_result = None
         memory_after_unload_mb = None
         stash_memory_after_mb = None
         stash_created = False
@@ -284,7 +298,7 @@ def install_engine_core_patch() -> None:
             if quant_config_path is not _QUANT_CONFIG_UNCHANGED:
                 load_kwargs["quant_config_path"] = quant_config_path
 
-            self.collective_rpc("load_model", kwargs=load_kwargs)
+            load_result = self.collective_rpc("load_model", kwargs=load_kwargs)
             logger.info("[gaudi_reconfigure] worker model reload complete")
 
             # Update config and reinitialize KV caches.
@@ -402,11 +416,21 @@ def install_engine_core_patch() -> None:
         if memory_before_mb is not None and memory_after_unload_mb is not None:
             freed_memory_mb = max(memory_before_mb - memory_after_unload_mb, 0.0)
 
+        restored_from_stash_workers = _count_named_boolean_values(load_result, "restored_from_stash", True)
+        cold_load_workers = _count_named_boolean_values(load_result, "restored_from_stash", False)
+        restored_from_stash = None
+        if restored_from_stash_workers or cold_load_workers:
+            restored_from_stash = cold_load_workers == 0
+
         return {
             "memory_before_mb": memory_before_mb,
             "memory_after_unload_mb": memory_after_unload_mb,
             "freed_memory_mb": freed_memory_mb,
             "stash_memory_after_mb": stash_memory_after_mb,
+            "restored_from_stash": restored_from_stash,
+            "restored_from_stash_workers": restored_from_stash_workers,
+            "cold_load_workers": cold_load_workers,
+            "num_gpu_blocks": new_config.cache_config.num_gpu_blocks,
         }
 
     EngineCore.gaudi_reconfigure_engine = gaudi_reconfigure_engine

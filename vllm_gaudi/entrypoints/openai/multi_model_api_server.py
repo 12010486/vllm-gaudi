@@ -290,6 +290,10 @@ class ModelSwitchResponse(BaseModel):
     memory_after_unload_mb: float | None = None
     freed_memory_mb: float | None = None
     stash_memory_after_mb: float | None = None
+    restored_from_stash: bool | None = None
+    restored_from_stash_workers: int | None = None
+    cold_load_workers: int | None = None
+    num_gpu_blocks: int | None = None
 
 
 def _resolve_multi_model_config_path() -> str | None:
@@ -596,6 +600,10 @@ def _attach_multi_model_router(app: FastAPI) -> None:
         memory_after_unload_mb = None
         freed_mb = None
         stash_memory_after_mb = None
+        restored_from_stash = None
+        restored_from_stash_workers = None
+        cold_load_workers = None
+        num_gpu_blocks = None
         if isinstance(switch_metrics, dict):
             reconfigure_s = switch_metrics.get("reconfigure_s")
             if isinstance(reconfigure_s, (int, float)):
@@ -604,6 +612,10 @@ def _attach_multi_model_router(app: FastAPI) -> None:
             raw_after_unload_mb = switch_metrics.get("memory_after_unload_mb")
             raw_freed_mb = switch_metrics.get("freed_memory_mb")
             raw_stash_after_mb = switch_metrics.get("stash_memory_after_mb")
+            raw_restored_from_stash = switch_metrics.get("restored_from_stash")
+            raw_restored_from_stash_workers = switch_metrics.get("restored_from_stash_workers")
+            raw_cold_load_workers = switch_metrics.get("cold_load_workers")
+            raw_num_gpu_blocks = switch_metrics.get("num_gpu_blocks")
             if isinstance(raw_before_mb, (int, float)):
                 memory_before_mb = float(raw_before_mb)
             if isinstance(raw_after_unload_mb, (int, float)):
@@ -612,6 +624,14 @@ def _attach_multi_model_router(app: FastAPI) -> None:
                 freed_mb = float(raw_freed_mb)
             if isinstance(raw_stash_after_mb, (int, float)):
                 stash_memory_after_mb = float(raw_stash_after_mb)
+            if isinstance(raw_restored_from_stash, bool):
+                restored_from_stash = raw_restored_from_stash
+            if isinstance(raw_restored_from_stash_workers, int):
+                restored_from_stash_workers = raw_restored_from_stash_workers
+            if isinstance(raw_cold_load_workers, int):
+                cold_load_workers = raw_cold_load_workers
+            if isinstance(raw_num_gpu_blocks, int):
+                num_gpu_blocks = raw_num_gpu_blocks
 
         return ModelSwitchResponse(
             previous_model=previous_model,
@@ -623,6 +643,10 @@ def _attach_multi_model_router(app: FastAPI) -> None:
             memory_after_unload_mb=memory_after_unload_mb,
             freed_memory_mb=freed_mb,
             stash_memory_after_mb=stash_memory_after_mb,
+            restored_from_stash=restored_from_stash,
+            restored_from_stash_workers=restored_from_stash_workers,
+            cold_load_workers=cold_load_workers,
+            num_gpu_blocks=num_gpu_blocks,
         )
 
     app.include_router(router)

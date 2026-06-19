@@ -224,7 +224,7 @@ class HPUWorker(WorkerBase):
         self,
         vllm_config: Optional[VllmConfig] = None,
         quant_config_path: Optional[str] | object = _QUANT_CONFIG_UNCHANGED,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Load a model. If vllm_config is provided, update config and rebuild runner.
 
         If a runner was previously stashed for this model (weights on CPU from
@@ -255,7 +255,9 @@ class HPUWorker(WorkerBase):
                 # weights are on CPU — just move them back to HPU.
                 self.restore_stashed_model(vllm_config=vllm_config, restore_kv_cache=False)
                 self.kv_cache_sleeping = False
-                return
+                return {
+                    "restored_from_stash": True,
+                }
 
             with set_current_vllm_config(vllm_config):
                 self.model_runner = HPUModelRunner(
@@ -267,6 +269,9 @@ class HPUWorker(WorkerBase):
 
         self.model_sleeping = False
         self.kv_cache_sleeping = False
+        return {
+            "restored_from_stash": False,
+        }
 
     def restore_stashed_model(
         self,
