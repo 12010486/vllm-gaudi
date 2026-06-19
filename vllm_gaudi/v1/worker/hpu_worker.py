@@ -93,6 +93,10 @@ class HPUWorker(WorkerBase):
         # original warmup block count, keeping KV-cache tensor shapes stable
         # across reconfigures and avoiding HPU recipe recompilation.
         self._cap_kv_blocks: int | None = None
+        # Optional set of warmed num_blocks values extracted from stashed
+        # runner graphed buckets. Used to clamp allocations to the closest
+        # warmed shape when memory shrinks on reconfigure.
+        self._warmed_block_counts: set[int] | None = None
 
     def _apply_vllm_config(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
@@ -105,6 +109,16 @@ class HPUWorker(WorkerBase):
         self.device_config = vllm_config.device_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+
+    def _find_closest_warmed_block_count(self, target_blocks: int) -> int | None:
+        if not self._warmed_block_counts:
+            return None
+
+        lower_or_equal = [b for b in self._warmed_block_counts if b <= target_blocks]
+        if lower_or_equal:
+            return max(lower_or_equal)
+
+        return min(self._warmed_block_counts)
 
     def _runner_stash_key(self, vllm_config: VllmConfig) -> tuple[object, ...]:
         compile_cfg = vllm_config.compilation_config
@@ -257,6 +271,19 @@ class HPUWorker(WorkerBase):
             if stash_key in self._model_runner_stash:
                 # Runner is alive with compiled graph cache intact;
                 # weights are on CPU — just move them back to HPU.
+                stashed_runner = self._model_runner_stash.get(stash_key)
+                warmed_blocks: set[int] = set()
+                if stashed_runner is not None and hasattr(stashed_runner, "graphed_buckets"):
+                    for bucket in stashed_runner.graphed_buckets:
+                        if isinstance(bucket, tuple) and len(bucket) >= 3 and isinstance(bucket[2], int):
+                            warmed_blocks.add(bucket[2])
+                self._warmed_block_counts = warmed_blocks if warmed_blocks else None
+                if self._warmed_block_counts:
+                    logger.info(
+                        "[HPUWorker] Loaded warmed block counts from stash: %s",
+                        sorted(self._warmed_block_counts),
+                    )
+
                 # Capture the warmup block count BEFORE restore overwrites
                 # kv_cache_config so we can cap the new allocation to the
                 # same shape that all compiled HPU recipes expect.
@@ -536,6 +563,22 @@ class HPUWorker(WorkerBase):
                     mamba_state_per_block, ratio)
                 available = adjusted
 
+        if self._warmed_block_counts and single_kv_block_size_bytes > 0 and available > 0:
+            allocable_blocks = int(available // single_kv_block_size_bytes)
+            closest_warmed = self._find_closest_warmed_block_count(allocable_blocks)
+            if closest_warmed is not None and closest_warmed != allocable_blocks:
+                warmed_bytes = closest_warmed * single_kv_block_size_bytes
+                if warmed_bytes < available:
+                    logger.info(
+                        "[HPUWorker] Adjusting usable KV cache from %s (%d blocks) "
+                        "to closest warmed shape %s (%d blocks).",
+                        format_bytes(available),
+                        allocable_blocks,
+                        format_bytes(warmed_bytes),
+                        closest_warmed,
+                    )
+                    available = warmed_bytes
+
         return available
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
@@ -553,30 +596,40 @@ class HPUWorker(WorkerBase):
         # graphs occupy HPU memory, leaving fewer free bytes), the cached
         # recipes are invalid for the new shape.  
         #
-        # When _cap_kv_blocks is set we are on the stash-restore path and
-        # know the original warmup block count.  If the new allocation
-        # differs, invalidate graphed_buckets so compile_or_warm_up_model()
-        # re-runs warmup_model() for the new shape.  The overhead is paid
-        # only once per model: the next stash-restore of the same model
-        # will find the stash already stores the new block count and skip
-        # re-warmup.
-        if self._cap_kv_blocks is not None and self.model_runner is not None:
-            new_blocks = kv_cache_config.num_blocks
-            if new_blocks != self._cap_kv_blocks:
+        # Prefer warmed-set membership for shape validation when available.
+        # If the newly allocated num_blocks is not present in warmed tuples,
+        # force re-warmup by invalidating graphed buckets.
+        should_rewarm = False
+        new_blocks = kv_cache_config.num_blocks
+        if self._warmed_block_counts is not None:
+            should_rewarm = new_blocks not in self._warmed_block_counts
+            if should_rewarm:
+                logger.warning(
+                    "[HPUWorker] KV cache block count %d is not in warmed set %s. "
+                    "Invalidating graphed_buckets to trigger re-warmup.",
+                    new_blocks,
+                    sorted(self._warmed_block_counts),
+                )
+        elif self._cap_kv_blocks is not None:
+            should_rewarm = new_blocks != self._cap_kv_blocks
+            if should_rewarm:
                 logger.warning(
                     "[HPUWorker] KV cache block count changed from warmup "
                     "value %d to %d (likely due to cross-model graph memory "
-                    "occupying HPU during reconfigure).  Invalidating "
+                    "occupying HPU during reconfigure). Invalidating "
                     "graphed_buckets to trigger re-warmup for the new shape.",
                     self._cap_kv_blocks,
                     new_blocks,
                 )
-                # Clear the set; compile_or_warm_up_model() checks
-                # `if not graphed_buckets` and will call warmup_model().
-                self.model_runner.graphed_buckets = set()  # type: ignore[union-attr]
 
-        # Cap has been applied / check is done; clear it now.
+        if should_rewarm and self.model_runner is not None:
+            # compile_or_warm_up_model() checks `if not graphed_buckets`
+            # and will call warmup_model().
+            self.model_runner.graphed_buckets = set()  # type: ignore[union-attr]
+
+        # Stash-derived constraints are one-shot for this initialization.
         self._cap_kv_blocks = None
+        self._warmed_block_counts = None
 
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.
