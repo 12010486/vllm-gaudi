@@ -553,6 +553,22 @@ class MoeMatmul(torch.nn.Module):
     def set_bias(self, b):
         self.bias = b
 
+    def _apply(self, fn):
+        # weight and bias are plain tensor attributes (not registered Parameters
+        # or Buffers), so nn.Module._apply() does not touch them.  Override here
+        # so that model.to(device) / model.to(dtype) etc. correctly move them
+        # through the standard PyTorch _apply chain.  This also prevents them
+        # from appearing as "stray" tensors in _move_remaining_tensors_to_device
+        # during sleep-mode wake_up.
+        ret = super()._apply(fn)
+        if hasattr(self, 'weight') and isinstance(self.weight, torch.Tensor) \
+                and not isinstance(self.weight, torch.nn.Parameter):
+            self.weight = fn(self.weight)
+        if hasattr(self, 'bias') and isinstance(self.bias, torch.Tensor) \
+                and not isinstance(self.bias, torch.nn.Parameter):
+            self.bias = fn(self.bias)
+        return ret
+
     def forward(self, state, expert_id, w):
         raise NotImplementedError()
 
