@@ -345,12 +345,13 @@ class HpuPlatform(Platform):
                             attn_block_size,
                             new_attn_page,
                         )
-            if not cache_config.user_specified_block_size:
-                cache_config.user_specified_block_size = True
-                super().update_block_size_for_backend(vllm_config)
-                cache_config.user_specified_block_size = False
-            else:
-                super().update_block_size_for_backend(vllm_config)
+            # Set user_specified_block_size=True permanently so that
+            # check_and_update_config (which runs again on every
+            # VllmConfig.__post_init__, including pickle deserialization in
+            # MultiprocExecutor IPC) will not reset block_size back to the
+            # HPU default of 128.
+            cache_config.user_specified_block_size = True
+            super().update_block_size_for_backend(vllm_config)
         else:
             super().update_block_size_for_backend(vllm_config)
 
