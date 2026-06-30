@@ -659,8 +659,26 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
         self._cache_weight_lists()
 
     def _apply(self, fn):
-        # called by .to(device/dtype), etc. Always rebuild packed cache.
+        # called by .to(device/dtype), etc.
+        # super()._apply(fn) only touches registered nn.Parameters and buffers.
+        # MoeMatmul.weight (and .bias) are plain tensor attributes set via
+        # set_weight()/set_bias() — not registered — so super() skips them.
+        # We must apply fn explicitly so they move with the rest of the model.
+        # Without this, _cache_weight_lists() would rebuild the cache from the
+        # old-device tensors and the stray scan would create duplicate HPU
+        # copies of every expert weight, exhausting device memory on wake_up.
         ret = super()._apply(fn)
+        for moe_matmul in self.w13_list:
+            if hasattr(moe_matmul, 'weight') and isinstance(moe_matmul.weight, torch.Tensor):
+                moe_matmul.weight = fn(moe_matmul.weight)
+            if hasattr(moe_matmul, 'bias') and isinstance(moe_matmul.bias, torch.Tensor):
+                moe_matmul.bias = fn(moe_matmul.bias)
+        for moe_matmul in self.w2_list:
+            if hasattr(moe_matmul, 'weight') and isinstance(moe_matmul.weight, torch.Tensor):
+                moe_matmul.weight = fn(moe_matmul.weight)
+            if hasattr(moe_matmul, 'bias') and isinstance(moe_matmul.bias, torch.Tensor):
+                moe_matmul.bias = fn(moe_matmul.bias)
+        # Rebuild views from the now correctly-placed MoeMatmul tensors.
         self._cache_weight_lists()
         return ret
 
