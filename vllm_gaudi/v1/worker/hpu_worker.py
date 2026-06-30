@@ -32,7 +32,7 @@ from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerO
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
-from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner, _GDN_MAMBA_TYPES, _move_remaining_tensors_to_device
+from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner, _GDN_MAMBA_TYPES, _move_remaining_tensors_to_device, _rebind_moe_expert_weights
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_gaudi.extension.logger import logger as init_logger
@@ -784,6 +784,11 @@ class HPUWorker(WorkerBase):
                         "[wake_up] model.to(hpu) done; HPU free before stray-tensor move: %s GiB",
                         f"{hpu_free_after_weights:.2f}" if hpu_free_after_weights is not None else "?",
                     )
+                    # Re-derive MoeMatmul.weight slices from the now-moved
+                    # parent FusedMoE registered params (w13_weight/w2_weight).
+                    # VllmMixtureOfExpertsOp._apply nullified them to prevent
+                    # the stray scan from creating duplicate HPU copies.
+                    _rebind_moe_expert_weights(self.model_runner.model)
                     # Move back non-Parameter/non-Buffer tensors that were
                     # sent to CPU during sleep.
                     _move_remaining_tensors_to_device(

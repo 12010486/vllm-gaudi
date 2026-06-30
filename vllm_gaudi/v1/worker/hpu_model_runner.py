@@ -339,6 +339,45 @@ def _move_remaining_tensors_to_device(model: torch.nn.Module,
         logger.info("Moved %d stray tensors to %s", moved, device)
 
 
+def _rebind_moe_expert_weights(model: torch.nn.Module) -> None:
+    """Re-derive MoeMatmul.weight slices from the parent layer's registered weights.
+
+    VllmMixtureOfExpertsOp._apply nullifies MoeMatmul.weight (plain tensor
+    attributes that are views/slices of the parent FusedMoE layer's
+    w13_weight / w2_weight registered parameters) to prevent the stray scan
+    from moving them as duplicate copies alongside the already-moved params.
+
+    This function walks the model after model.to(device) has completed (so all
+    registered params are on the target device) and re-derives each per-expert
+    slice from the now-moved w13_weight / w2_weight, then rebuilds the packed
+    cache views.
+
+    Must be called AFTER model.to(device) and BEFORE
+    _move_remaining_tensors_to_device so that the stray scan finds all
+    MoeMatmul.weight tensors already on the correct device.
+    """
+    from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOp  # local to avoid circular import
+    for module in model.modules():
+        moe_op = getattr(module, 'moe_op', None)
+        if not isinstance(moe_op, VllmMixtureOfExpertsOp):
+            continue
+        w13_weight = getattr(module, 'w13_weight', None)
+        w2_weight = getattr(module, 'w2_weight', None)
+        if w13_weight is None or w2_weight is None:
+            continue
+        n = moe_op.num_experts
+        for i in range(n):
+            moe_op.w13_list[i].set_weight(w13_weight[i])
+            moe_op.w2_list[i].set_weight(w2_weight[i])
+        w13_bias = getattr(module, 'w13_bias', None)
+        w2_bias = getattr(module, 'w2_bias', None)
+        if w13_bias is not None and w2_bias is not None:
+            for i in range(n):
+                moe_op.w13_list[i].set_bias(w13_bias[i])
+                moe_op.w2_list[i].set_bias(w2_bias[i])
+        moe_op._cache_weight_lists()
+
+
 class BucketingFailedException(Exception):
     pass
 

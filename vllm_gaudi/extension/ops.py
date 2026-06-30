@@ -659,27 +659,26 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
         self._cache_weight_lists()
 
     def _apply(self, fn):
-        # called by .to(device/dtype), etc.
-        # super()._apply(fn) only touches registered nn.Parameters and buffers.
-        # MoeMatmul.weight (and .bias) are plain tensor attributes set via
-        # set_weight()/set_bias() — not registered — so super() skips them.
-        # We must apply fn explicitly so they move with the rest of the model.
-        # Without this, _cache_weight_lists() would rebuild the cache from the
-        # old-device tensors and the stray scan would create duplicate HPU
-        # copies of every expert weight, exhausting device memory on wake_up.
+        # Needed for sleep/wake-up on single HPU device. When model.to(device) is called, the _apply chain moves the
+        #
+        # Strategy:
+        #   1. Nullify the stale slices and cached views (None is not a tensor
+        #      so the stray scan ignores them).
+        #   2. Let model.to(device) complete the full _apply chain so that
+        #      w13_weight / w2_weight are on the target device.
+        #   3. _rebind_moe_expert_weights() (called from hpu_worker.py wake_up
+        #      AFTER model.to(hpu) returns) re-derives the per-expert slices
+        #      from the now-moved params and rebuilds the packed cache.
         ret = super()._apply(fn)
-        for moe_matmul in self.w13_list:
-            if hasattr(moe_matmul, 'weight') and isinstance(moe_matmul.weight, torch.Tensor):
-                moe_matmul.weight = fn(moe_matmul.weight)
-            if hasattr(moe_matmul, 'bias') and isinstance(moe_matmul.bias, torch.Tensor):
-                moe_matmul.bias = fn(moe_matmul.bias)
-        for moe_matmul in self.w2_list:
-            if hasattr(moe_matmul, 'weight') and isinstance(moe_matmul.weight, torch.Tensor):
-                moe_matmul.weight = fn(moe_matmul.weight)
-            if hasattr(moe_matmul, 'bias') and isinstance(moe_matmul.bias, torch.Tensor):
-                moe_matmul.bias = fn(moe_matmul.bias)
-        # Rebuild views from the now correctly-placed MoeMatmul tensors.
-        self._cache_weight_lists()
+        for moe_matmul in (*self.w13_list, *self.w2_list):
+            if hasattr(moe_matmul, 'weight'):
+                moe_matmul.weight = None
+            if hasattr(moe_matmul, 'bias'):
+                moe_matmul.bias = None
+        self._cached_w13_views = None
+        self._cached_w2_views = None
+        self._cached_w13_bias_views = None
+        self._cached_w2_bias_views = None
         return ret
 
     def forward(self, hidden_states, expert_routing_table, router_weights, permuted_weights=True, activation="silu"):
