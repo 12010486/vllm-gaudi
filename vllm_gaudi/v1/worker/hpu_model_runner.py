@@ -342,19 +342,17 @@ def _move_remaining_tensors_to_device(model: torch.nn.Module,
 def _rebind_moe_expert_weights(model: torch.nn.Module) -> None:
     """Re-derive MoeMatmul.weight slices from the parent layer's registered weights.
 
-    VllmMixtureOfExpertsOp._apply nullifies MoeMatmul.weight (plain tensor
-    attributes that are views/slices of the parent FusedMoE layer's
-    w13_weight / w2_weight registered parameters) to prevent the stray scan
-    from moving them as duplicate copies alongside the already-moved params.
+    MoeMatmul.weight is a plain tensor attribute (set via set_weight()) that
+    holds a view/slice of the parent FusedMoE layer's w13_weight / w2_weight
+    registered parameters.  After model.to(device), the registered params are
+    on the new device but MoeMatmul.weight still points to the OLD device's
+    storage, making it stale.  If the stray scan runs before rebinding, it
+    would move these stale views independently, creating duplicate copies of
+    the expert weights on the target device.
 
-    This function walks the model after model.to(device) has completed (so all
-    registered params are on the target device) and re-derives each per-expert
-    slice from the now-moved w13_weight / w2_weight, then rebuilds the packed
-    cache views.
-
-    Must be called AFTER model.to(device) and BEFORE
+    Call this AFTER model.to(device) and BEFORE
     _move_remaining_tensors_to_device so that the stray scan finds all
-    MoeMatmul.weight tensors already on the correct device.
+    MoeMatmul.weight tensors already on the correct device and skips them.
     """
     from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOp  # local to avoid circular import
     for module in model.modules():
@@ -4597,6 +4595,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self._sync_shared_moe_gates()
                 if not is_fake_hpu():
                     self.model = self.model.to("hpu")
+                    # Re-derive MoeMatmul.weight slices from the now-HPU params
+                    # BEFORE the stray scan, so it doesn't move stale CPU
+                    # views as duplicate HPU copies.
+                    _rebind_moe_expert_weights(self.model)
                     _move_remaining_tensors_to_device(self.model, "hpu")
                     htorch.core.mark_step()
                 if not disable_mark_scales_as_const:

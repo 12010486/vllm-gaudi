@@ -712,6 +712,10 @@ class HPUWorker(WorkerBase):
         else:
             with HabanaMemoryProfiler() as m:
                 self.model_runner.model.to("cpu")
+                # Re-derive MoeMatmul.weight slices from the now-CPU params
+                # BEFORE the stray scan so stale HPU views aren't moved as
+                # duplicate CPU copies.
+                _rebind_moe_expert_weights(self.model_runner.model)
                 # Move non-Parameter/non-Buffer HPU tensors that
                 # nn.Module.to() would not touch.  After the KV-discard above,
                 # module.kv_cache is already None so there is nothing large to
@@ -785,9 +789,11 @@ class HPUWorker(WorkerBase):
                         f"{hpu_free_after_weights:.2f}" if hpu_free_after_weights is not None else "?",
                     )
                     # Re-derive MoeMatmul.weight slices from the now-moved
-                    # parent FusedMoE registered params (w13_weight/w2_weight).
-                    # VllmMixtureOfExpertsOp._apply nullified them to prevent
-                    # the stray scan from creating duplicate HPU copies.
+                    # parent FusedMoE registered params (w13_weight/w2_weight)
+                    # BEFORE the stray scan.  MoeMatmul.weight is a stale CPU
+                    # view after model.to(hpu); without rebinding, the stray
+                    # scan would move it independently, creating a duplicate
+                    # HPU copy of every expert weight (~50 GiB for granite).
                     _rebind_moe_expert_weights(self.model_runner.model)
                     # Move back non-Parameter/non-Buffer tensors that were
                     # sent to CPU during sleep.
