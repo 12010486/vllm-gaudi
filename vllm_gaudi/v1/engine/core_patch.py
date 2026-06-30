@@ -17,7 +17,7 @@ from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.utils.hashing import get_hash_fn_by_name
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash, resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -320,9 +320,19 @@ def install_engine_core_patch() -> None:
                 logger.warning("Disabling chunked prefill for model without KVCache")
                 new_config.scheduler_config.enable_chunked_prefill = False
 
-            scheduler_block_size = (new_config.cache_config.block_size *
-                                    new_config.parallel_config.decode_context_parallel_size *
-                                    new_config.parallel_config.prefill_context_parallel_size)
+            # Use the same block-size resolution as the initial EngineCore startup
+            # (core.py). For hybrid models with multiple KV-cache groups (e.g.
+            # granite Mamba+Attention), the Mamba group's block_size equals
+            # max_model_len in "none" cache mode, so the simple
+            # block_size * cp_size formula produces a scheduler_block_size that
+            # does NOT divide the Mamba group block_size, triggering the
+            # assertion `scheduler_block_size % g.kv_cache_spec.block_size == 0`
+            # inside KVCacheCoordinator.__init__. resolve_kv_cache_block_sizes
+            # returns LCM(group block sizes) which is always divisible by every
+            # group's block_size, matching what core.py computes at cold start.
+            scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+                kv_cache_config, new_config
+            )
 
             self.scheduler = Scheduler(
                 vllm_config=new_config,
@@ -331,6 +341,7 @@ def install_engine_core_patch() -> None:
                 include_finished_set=False,
                 log_stats=self.log_stats,
                 block_size=scheduler_block_size,
+                hash_block_size=hash_block_size,
             )
             logger.info("[gaudi_reconfigure] scheduler rebuilt")
 
