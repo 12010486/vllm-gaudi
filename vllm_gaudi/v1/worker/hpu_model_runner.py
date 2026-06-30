@@ -176,7 +176,9 @@ def _override_platform_device_type(device_type: str):
         current_platform.device_type = original
 
 
-def _move_remaining_tensors_to_device(model: torch.nn.Module, device: str) -> None:
+def _move_remaining_tensors_to_device(model: torch.nn.Module,
+                                      device: str,
+                                      log_large_tensors_mb: float = 0.0) -> None:
     """Move non-Parameter/non-buffer tensors left on the wrong device.
 
     ``nn.Module.to()`` only traverses ``_parameters``, ``_buffers`` and
@@ -185,6 +187,13 @@ def _move_remaining_tensors_to_device(model: torch.nn.Module, device: str) -> No
     embeds, dynamic-KV-quant range scalars) are invisible to it.  This
     helper walks every module's ``__dict__`` and moves stray tensors
     in-place.
+
+    Args:
+        model: The model to walk.
+        device: Target device string (e.g. "hpu", "cpu").
+        log_large_tensors_mb: If > 0, log module/attr/shape for any stray
+            tensor larger than this many MiB.  Useful for diagnosing
+            unexpected large stray tensors during wake-up.
     """
     target_type = torch.device(device).type
 
@@ -257,6 +266,11 @@ def _move_remaining_tensors_to_device(model: torch.nn.Module, device: str) -> No
     })
 
     moved = 0
+    _log_threshold_bytes = int(log_large_tensors_mb * 1024 * 1024) if log_large_tensors_mb > 0 else -1
+
+    def _size_bytes(t: torch.Tensor) -> int:
+        return t.nelement() * t.element_size()
+
     for mod in model.modules():
         # Compute once per module; None if not an INC-patched module.
         scale_members = getattr(mod, "scale_members", None)
@@ -273,6 +287,49 @@ def _move_remaining_tensors_to_device(model: torch.nn.Module, device: str) -> No
             if scale_members is not None and attr_name in scale_members:
                 continue
             obj = mod.__dict__[attr_name]
+            # Log large stray tensors/containers if threshold is set (for debugging).
+            if _log_threshold_bytes > 0:
+                if isinstance(obj, torch.Tensor):
+                    sb = _size_bytes(obj)
+                    if sb >= _log_threshold_bytes and obj.device.type != torch.device(device).type:
+                        logger.info(
+                            "[stray_tensor] %s.%s shape=%s dtype=%s size=%.2f MiB → moving to %s",
+                            type(mod).__name__, attr_name, tuple(obj.shape), obj.dtype,
+                            sb / (1024 * 1024), device,
+                        )
+                elif isinstance(obj, (list, tuple, dict)):
+                    # Recursively sum tensor sizes in containers.
+                    def _container_bytes(x):
+                        if isinstance(x, torch.Tensor):
+                            return x.nelement() * x.element_size()
+                        if isinstance(x, (list, tuple)):
+                            return sum(_container_bytes(xi) for xi in x)
+                        if isinstance(x, dict):
+                            return sum(_container_bytes(v) for v in x.values())
+                        return 0
+
+                    def _container_devices(x):
+                        devs = set()
+                        if isinstance(x, torch.Tensor):
+                            devs.add(x.device.type)
+                        elif isinstance(x, (list, tuple)):
+                            for xi in x:
+                                devs |= _container_devices(xi)
+                        elif isinstance(x, dict):
+                            for v in x.values():
+                                devs |= _container_devices(v)
+                        return devs
+
+                    csb = _container_bytes(obj)
+                    if csb >= _log_threshold_bytes:
+                        cdevs = _container_devices(obj)
+                        target_dev = torch.device(device).type
+                        if cdevs and target_dev not in cdevs:
+                            logger.info(
+                                "[stray_container] %s.%s type=%s total_size=%.2f MiB devices=%s → moving to %s",
+                                type(mod).__name__, attr_name, type(obj).__name__,
+                                csb / (1024 * 1024), cdevs, device,
+                            )
             new_obj, cnt, changed = _move_obj(obj)
             if cnt:
                 moved += cnt
@@ -1446,6 +1503,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         forward_ctx = self.vllm_config.compilation_config.static_forward_context
         block_size = self.vllm_config.cache_config.block_size
+        logger.info(
+            "[get_kv_cache_spec] vllm_config id=%d, cache_config id=%d, "
+            "block_size=%d, mamba_block_size=%s, mamba_cache_mode=%s, mamba_page_size_padded=%s",
+            id(self.vllm_config), id(self.vllm_config.cache_config),
+            block_size,
+            getattr(self.vllm_config.cache_config, 'mamba_block_size', 'N/A'),
+            getattr(self.vllm_config.cache_config, 'mamba_cache_mode', 'N/A'),
+            getattr(self.vllm_config.cache_config, 'mamba_page_size_padded', 'N/A'),
+        )
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
         for layer_name, attn_module in forward_ctx.items():

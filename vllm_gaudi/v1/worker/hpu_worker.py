@@ -680,24 +680,12 @@ class HPUWorker(WorkerBase):
         assert not htorch.utils.internal.is_lazy(
         ) or self.model_config.enforce_eager, "Sleep mode is supported only for torch.compile mode"
 
-        # Handle model - if model was loaded move it to CPU
-        if self.model_sleeping:
-            logger.warning("Model is already in a sleep mode, skipping moving it to CPU")
-        elif self.model_runner is None or not hasattr(self.model_runner, "model") or self.model_runner.model is None:
-            logger.warning("Model was not loaded yet, skipping moving it to CPU")
-        else:
-            with HabanaMemoryProfiler() as m:
-                self.model_runner.model.to("cpu")
-                # Move non-Parameter/non-Buffer HPU tensors that
-                # nn.Module.to() would not touch.
-                _move_remaining_tensors_to_device(self.model_runner.model, "cpu")
-                gc.collect()
-                torch.hpu.synchronize()
-            msg = f"Moving model to CPU for sleep mode took {m.get_summary_string()}"
-            logger.info(msg)
-            self.model_sleeping = True
-
-        # Handle KV cache - discard it
+        # Handle KV cache FIRST so that module.kv_cache attributes are set to
+        # None before model.to("cpu") runs.  This prevents
+        # _move_remaining_tensors_to_device from copying the (potentially very
+        # large) KV cache tensors to CPU as stray tensors, which would then
+        # fail to be moved back to HPU correctly during wake_up() and cause
+        # model.to("hpu") to move ~2× the expected memory.
         if self.kv_cache_sleeping:
             logger.warning("KV cache has already been discarded by calling sleep method and it has not been "
                            "reinitialized by calling wake up method yet, skipping discarding it again")
@@ -715,6 +703,27 @@ class HPUWorker(WorkerBase):
             msg = f"Discarding KV cache for sleep mode took {m.get_summary_string()}"
             logger.info(msg)
             self.kv_cache_sleeping = True
+
+        # Handle model - if model was loaded move it to CPU
+        if self.model_sleeping:
+            logger.warning("Model is already in a sleep mode, skipping moving it to CPU")
+        elif self.model_runner is None or not hasattr(self.model_runner, "model") or self.model_runner.model is None:
+            logger.warning("Model was not loaded yet, skipping moving it to CPU")
+        else:
+            with HabanaMemoryProfiler() as m:
+                self.model_runner.model.to("cpu")
+                # Move non-Parameter/non-Buffer HPU tensors that
+                # nn.Module.to() would not touch.  After the KV-discard above,
+                # module.kv_cache is already None so there is nothing large to
+                # copy.  log_large_tensors_mb=10.0 logs any remaining stray
+                # tensors >= 10 MiB for diagnostics.
+                _move_remaining_tensors_to_device(self.model_runner.model, "cpu",
+                                                  log_large_tensors_mb=10.0)
+                gc.collect()
+                torch.hpu.synchronize()
+            msg = f"Moving model to CPU for sleep mode took {m.get_summary_string()}"
+            logger.info(msg)
+            self.model_sleeping = True
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         """Wake up the worker from sleep mode.
@@ -758,11 +767,29 @@ class HPUWorker(WorkerBase):
                     )
                 with HabanaMemoryProfiler() as m:
                     self.model_runner.model.to(self.vllm_config.device_config.device)
+                    # Force GC and sync BEFORE moving stray tensors to HPU.
+                    # Without this, old CPU-side tensor references may not be
+                    # released yet and the HPU allocator can report spuriously
+                    # low free memory, causing the 6 MB allocation below to
+                    # fail even though 50+ GiB are nominally free (observed
+                    # in practice with granite-4.0-h-small after the 64 GiB
+                    # model is placed back on HPU).
+                    gc.collect()
+                    torch.hpu.synchronize()
+                    hpu_free_after_weights = None
+                    with contextlib.suppress(Exception):
+                        free_b, total_b = torch.hpu.mem_get_info()
+                        hpu_free_after_weights = free_b / (1024**3)
+                    logger.info(
+                        "[wake_up] model.to(hpu) done; HPU free before stray-tensor move: %s GiB",
+                        f"{hpu_free_after_weights:.2f}" if hpu_free_after_weights is not None else "?",
+                    )
                     # Move back non-Parameter/non-Buffer tensors that were
                     # sent to CPU during sleep.
                     _move_remaining_tensors_to_device(
                         self.model_runner.model,
                         str(self.vllm_config.device_config.device),
+                        log_large_tensors_mb=1.0,
                     )
                     gc.collect()
                     torch.hpu.synchronize()
