@@ -650,6 +650,10 @@ class HPUWorker(WorkerBase):
         else:
             with HabanaMemoryProfiler() as m:
                 self.model_runner.model.to("cpu")
+                # Re-derive MoeMatmul.weight slices from the now-CPU params
+                # before the stray scan so stale HPU views aren't moved as
+                # duplicate CPU copies.
+                _rebind_moe_expert_weights(self.model_runner.model)
                 # Move non-Parameter/non-Buffer HPU tensors that
                 # nn.Module.to() would not touch.
                 _move_remaining_tensors_to_device(self.model_runner.model, "cpu")
@@ -678,30 +682,6 @@ class HPUWorker(WorkerBase):
             logger.info(msg)
             self.kv_cache_sleeping = True
 
-        # Handle model - if model was loaded move it to CPU
-        if self.model_sleeping:
-            logger.warning("Model is already in a sleep mode, skipping moving it to CPU")
-        elif self.model_runner is None or not hasattr(self.model_runner, "model") or self.model_runner.model is None:
-            logger.warning("Model was not loaded yet, skipping moving it to CPU")
-        else:
-            with HabanaMemoryProfiler() as m:
-                self.model_runner.model.to("cpu")
-                # Re-derive MoeMatmul.weight slices from the now-CPU params
-                # BEFORE the stray scan so stale HPU views aren't moved as
-                # duplicate CPU copies.
-                _rebind_moe_expert_weights(self.model_runner.model)
-                # Move non-Parameter/non-Buffer HPU tensors that
-                # nn.Module.to() would not touch.  After the KV-discard above,
-                # module.kv_cache is already None so there is nothing large to
-                # copy.  log_large_tensors_mb=10.0 logs any remaining stray
-                # tensors >= 10 MiB for diagnostics.
-                _move_remaining_tensors_to_device(self.model_runner.model, "cpu", log_large_tensors_mb=10.0)
-                gc.collect()
-                torch.hpu.synchronize()
-            msg = f"Moving model to CPU for sleep mode took {m.get_summary_string()}"
-            logger.info(msg)
-            self.model_sleeping = True
-
     def wake_up(self, tags: list[str] | None = None) -> None:
         """Wake up the worker from sleep mode.
         It can move the model back to HPU and/or reinitialize KV cache.
@@ -727,7 +707,7 @@ class HPUWorker(WorkerBase):
                     self.model_runner.model.to(self.vllm_config.device_config.device)
                     # Re-derive MoeMatmul.weight slices from the now-moved
                     # parent FusedMoE registered params (w13_weight/w2_weight)
-                    # BEFORE the stray scan.                  
+                    # before the stray scan.                  
                     _rebind_moe_expert_weights(self.model_runner.model)
                     # Move back non-Parameter/non-Buffer tensors that were
                     # sent to CPU during sleep.

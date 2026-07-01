@@ -667,8 +667,7 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
         # _rebind_moe_expert_weights() (called from hpu_worker.py before any
         # stray-tensor scan) will re-derive the slices from the now-moved
         # registered params and call _cache_weight_lists() again with correct
-        # tensors.  The stale cache built here is simply overwritten by that
-        # call and never reaches the stray scan.
+        # tensors.
         ret = super()._apply(fn)
         self._cache_weight_lists()
         return ret
