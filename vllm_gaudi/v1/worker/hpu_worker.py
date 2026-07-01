@@ -32,7 +32,8 @@ from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerO
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
-from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner, _GDN_MAMBA_TYPES, _move_remaining_tensors_to_device, _rebind_moe_expert_weights
+from vllm_gaudi.v1.worker.hpu_model_runner import (HPUModelRunner, _GDN_MAMBA_TYPES, _move_remaining_tensors_to_device,
+                                                   _rebind_moe_expert_weights)
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_gaudi.extension.logger import logger as init_logger
@@ -164,7 +165,8 @@ class HPUWorker(WorkerBase):
         set_random_seed(self.model_config.seed)
         logger.info(
             "[init_device] creating HPUModelRunner: vllm_config id=%d, cache_config id=%d, block_size=%d",
-            id(self.vllm_config), id(self.vllm_config.cache_config),
+            id(self.vllm_config),
+            id(self.vllm_config.cache_config),
             self.vllm_config.cache_config.block_size,
         )
         with set_current_vllm_config(self.vllm_config):
@@ -199,8 +201,10 @@ class HPUWorker(WorkerBase):
                 logger.info(
                     "[HPUWorker] Stashing runner for model: %s key=%s "
                     "runner_config id=%d, cache_config id=%d, block_size=%d",
-                    runner_config.model_config.model, stash_key,
-                    id(runner_config), id(runner_config.cache_config),
+                    runner_config.model_config.model,
+                    stash_key,
+                    id(runner_config),
+                    id(runner_config.cache_config),
                     runner_config.cache_config.block_size,
                 )
                 self._model_runner_stash[stash_key] = self.model_runner
@@ -260,14 +264,15 @@ class HPUWorker(WorkerBase):
         if vllm_config is not None:
             logger.info(
                 "[HPUWorker.load_model] incoming vllm_config id=%d, cache_config id=%d, block_size=%d",
-                id(vllm_config), id(vllm_config.cache_config),
+                id(vllm_config),
+                id(vllm_config.cache_config),
                 vllm_config.cache_config.block_size,
             )
             self._apply_vllm_config(vllm_config)
 
             stash_key = self._runner_stash_key(vllm_config)
-            logger.info("[HPUWorker] load_model stash lookup key=%s; stash has keys=%s",
-                        stash_key, list(self._model_runner_stash.keys()))
+            logger.info("[HPUWorker] load_model stash lookup key=%s; stash has keys=%s", stash_key,
+                        list(self._model_runner_stash.keys()))
             if stash_key in self._model_runner_stash:
                 # Runner is alive with compiled graph cache intact;
                 # weights are on CPU — just move them back to HPU.
@@ -314,7 +319,8 @@ class HPUWorker(WorkerBase):
         logger.info(
             "[restore_stashed_model] restored_config id=%d, cache_config id=%d, "
             "block_size=%d, mamba_block_size=%s, mamba_cache_mode=%s, mamba_page_size_padded=%s",
-            id(restored_config), id(restored_config.cache_config),
+            id(restored_config),
+            id(restored_config.cache_config),
             restored_config.cache_config.block_size,
             getattr(restored_config.cache_config, 'mamba_block_size', 'N/A'),
             getattr(restored_config.cache_config, 'mamba_cache_mode', 'N/A'),
@@ -329,7 +335,8 @@ class HPUWorker(WorkerBase):
         if vllm_config is not None:
             logger.info(
                 "[restore_stashed_model] incoming vllm_config id=%d, cache_config id=%d, block_size=%d",
-                id(vllm_config), id(vllm_config.cache_config),
+                id(vllm_config),
+                id(vllm_config.cache_config),
                 vllm_config.cache_config.block_size,
             )
         self._apply_vllm_config(restored_config)
@@ -721,8 +728,7 @@ class HPUWorker(WorkerBase):
                 # module.kv_cache is already None so there is nothing large to
                 # copy.  log_large_tensors_mb=10.0 logs any remaining stray
                 # tensors >= 10 MiB for diagnostics.
-                _move_remaining_tensors_to_device(self.model_runner.model, "cpu",
-                                                  log_large_tensors_mb=10.0)
+                _move_remaining_tensors_to_device(self.model_runner.model, "cpu", log_large_tensors_mb=10.0)
                 gc.collect()
                 torch.hpu.synchronize()
             msg = f"Moving model to CPU for sleep mode took {m.get_summary_string()}"
@@ -753,16 +759,10 @@ class HPUWorker(WorkerBase):
                 # Log registered buffer inventory BEFORE moving to HPU so we can
                 # diagnose unexpected large allocations during model.to(hpu).
                 with contextlib.suppress(Exception):
-                    total_param_bytes = sum(
-                        p.nelement() * p.element_size()
-                        for p in self.model_runner.model.parameters()
-                        if p is not None
-                    )
-                    total_buf_bytes = sum(
-                        b.nelement() * b.element_size()
-                        for b in self.model_runner.model.buffers()
-                        if b is not None
-                    )
+                    total_param_bytes = sum(p.nelement() * p.element_size()
+                                            for p in self.model_runner.model.parameters() if p is not None)
+                    total_buf_bytes = sum(b.nelement() * b.element_size() for b in self.model_runner.model.buffers()
+                                          if b is not None)
                     logger.info(
                         "[wake_up] pre-move inventory: params=%.3f GiB buffers=%.3f GiB total=%.3f GiB",
                         total_param_bytes / 2**30,

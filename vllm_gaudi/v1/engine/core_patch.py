@@ -330,9 +330,7 @@ def install_engine_core_patch() -> None:
             # inside KVCacheCoordinator.__init__. resolve_kv_cache_block_sizes
             # returns LCM(group block sizes) which is always divisible by every
             # group's block_size, matching what core.py computes at cold start.
-            scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
-                kv_cache_config, new_config
-            )
+            scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, new_config)
 
             self.scheduler = Scheduler(
                 vllm_config=new_config,

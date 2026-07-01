@@ -176,9 +176,7 @@ def _override_platform_device_type(device_type: str):
         current_platform.device_type = original
 
 
-def _move_remaining_tensors_to_device(model: torch.nn.Module,
-                                      device: str,
-                                      log_large_tensors_mb: float = 0.0) -> None:
+def _move_remaining_tensors_to_device(model: torch.nn.Module, device: str, log_large_tensors_mb: float = 0.0) -> None:
     """Move non-Parameter/non-buffer tensors left on the wrong device.
 
     ``nn.Module.to()`` only traverses ``_parameters``, ``_buffers`` and
@@ -294,8 +292,12 @@ def _move_remaining_tensors_to_device(model: torch.nn.Module,
                     if sb >= _log_threshold_bytes and obj.device.type != torch.device(device).type:
                         logger.info(
                             "[stray_tensor] %s.%s shape=%s dtype=%s size=%.2f MiB → moving to %s",
-                            type(mod).__name__, attr_name, tuple(obj.shape), obj.dtype,
-                            sb / (1024 * 1024), device,
+                            type(mod).__name__,
+                            attr_name,
+                            tuple(obj.shape),
+                            obj.dtype,
+                            sb / (1024 * 1024),
+                            device,
                         )
                 elif isinstance(obj, (list, tuple, dict)):
                     # Recursively sum tensor sizes in containers.
@@ -327,8 +329,12 @@ def _move_remaining_tensors_to_device(model: torch.nn.Module,
                         if cdevs and target_dev not in cdevs:
                             logger.info(
                                 "[stray_container] %s.%s type=%s total_size=%.2f MiB devices=%s → moving to %s",
-                                type(mod).__name__, attr_name, type(obj).__name__,
-                                csb / (1024 * 1024), cdevs, device,
+                                type(mod).__name__,
+                                attr_name,
+                                type(obj).__name__,
+                                csb / (1024 * 1024),
+                                cdevs,
+                                device,
                             )
             new_obj, cnt, changed = _move_obj(obj)
             if cnt:
@@ -1543,7 +1549,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         logger.info(
             "[get_kv_cache_spec] vllm_config id=%d, cache_config id=%d, "
             "block_size=%d, mamba_block_size=%s, mamba_cache_mode=%s, mamba_page_size_padded=%s",
-            id(self.vllm_config), id(self.vllm_config.cache_config),
+            id(self.vllm_config),
+            id(self.vllm_config.cache_config),
             block_size,
             getattr(self.vllm_config.cache_config, 'mamba_block_size', 'N/A'),
             getattr(self.vllm_config.cache_config, 'mamba_cache_mode', 'N/A'),
