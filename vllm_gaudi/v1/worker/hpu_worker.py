@@ -163,12 +163,6 @@ class HPUWorker(WorkerBase):
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
         # Set random seed.
         set_random_seed(self.model_config.seed)
-        logger.info(
-            "[init_device] creating HPUModelRunner: vllm_config id=%d, cache_config id=%d, block_size=%d",
-            id(self.vllm_config),
-            id(self.vllm_config.cache_config),
-            self.vllm_config.cache_config.block_size,
-        )
         with set_current_vllm_config(self.vllm_config):
             self.model_runner = HPUModelRunner(vllm_config=self.vllm_config, is_driver_worker=self.is_driver_worker)
         self.init_profiler()
@@ -198,15 +192,7 @@ class HPUWorker(WorkerBase):
             if self.model_runner is not None:
                 runner_config = getattr(self.model_runner, "vllm_config", self.vllm_config)
                 stash_key = self._runner_stash_key(runner_config)
-                logger.info(
-                    "[HPUWorker] Stashing runner for model: %s key=%s "
-                    "runner_config id=%d, cache_config id=%d, block_size=%d",
-                    runner_config.model_config.model,
-                    stash_key,
-                    id(runner_config),
-                    id(runner_config.cache_config),
-                    runner_config.cache_config.block_size,
-                )
+                logger.info("[HPUWorker] Stashing runner for model: %s", runner_config.model_config.model)
                 self._model_runner_stash[stash_key] = self.model_runner
                 self._model_runner_state_stash[stash_key] = {
                     "vllm_config": runner_config,
@@ -262,17 +248,9 @@ class HPUWorker(WorkerBase):
             logger.info("QUANT_CONFIG unchanged: %s", os.environ.get("QUANT_CONFIG"))
 
         if vllm_config is not None:
-            logger.info(
-                "[HPUWorker.load_model] incoming vllm_config id=%d, cache_config id=%d, block_size=%d",
-                id(vllm_config),
-                id(vllm_config.cache_config),
-                vllm_config.cache_config.block_size,
-            )
             self._apply_vllm_config(vllm_config)
 
             stash_key = self._runner_stash_key(vllm_config)
-            logger.info("[HPUWorker] load_model stash lookup key=%s; stash has keys=%s", stash_key,
-                        list(self._model_runner_stash.keys()))
             if stash_key in self._model_runner_stash:
                 # Runner is alive with compiled graph cache intact;
                 # weights are on CPU — just move them back to HPU.
@@ -316,29 +294,6 @@ class HPUWorker(WorkerBase):
             bucketing_manager.activate()
 
         restored_config = stashed_state.get("vllm_config", getattr(self.model_runner, "vllm_config", target_config))
-        logger.info(
-            "[restore_stashed_model] restored_config id=%d, cache_config id=%d, "
-            "block_size=%d, mamba_block_size=%s, mamba_cache_mode=%s, mamba_page_size_padded=%s",
-            id(restored_config),
-            id(restored_config.cache_config),
-            restored_config.cache_config.block_size,
-            getattr(restored_config.cache_config, 'mamba_block_size', 'N/A'),
-            getattr(restored_config.cache_config, 'mamba_cache_mode', 'N/A'),
-            getattr(restored_config.cache_config, 'mamba_page_size_padded', 'N/A'),
-        )
-        logger.info(
-            "[restore_stashed_model] model_runner.vllm_config id=%d, cache_config id=%d, block_size=%d",
-            id(self.model_runner.vllm_config),
-            id(self.model_runner.vllm_config.cache_config),
-            self.model_runner.vllm_config.cache_config.block_size,
-        )
-        if vllm_config is not None:
-            logger.info(
-                "[restore_stashed_model] incoming vllm_config id=%d, cache_config id=%d, block_size=%d",
-                id(vllm_config),
-                id(vllm_config.cache_config),
-                vllm_config.cache_config.block_size,
-            )
         self._apply_vllm_config(restored_config)
 
         self.model_sleeping = bool(stashed_state.get("model_sleeping", True))
@@ -756,19 +711,6 @@ class HPUWorker(WorkerBase):
                                                           "model") or self.model_runner.model is None:
                 logger.warning("Model was not loaded yet, skipping moving it to HPU")
             else:
-                # Log registered buffer inventory BEFORE moving to HPU so we can
-                # diagnose unexpected large allocations during model.to(hpu).
-                with contextlib.suppress(Exception):
-                    total_param_bytes = sum(p.nelement() * p.element_size()
-                                            for p in self.model_runner.model.parameters() if p is not None)
-                    total_buf_bytes = sum(b.nelement() * b.element_size() for b in self.model_runner.model.buffers()
-                                          if b is not None)
-                    logger.info(
-                        "[wake_up] pre-move inventory: params=%.3f GiB buffers=%.3f GiB total=%.3f GiB",
-                        total_param_bytes / 2**30,
-                        total_buf_bytes / 2**30,
-                        (total_param_bytes + total_buf_bytes) / 2**30,
-                    )
                 with HabanaMemoryProfiler() as m:
                     self.model_runner.model.to(self.vllm_config.device_config.device)
                     # Force GC and sync BEFORE moving stray tensors to HPU.
@@ -780,14 +722,6 @@ class HPUWorker(WorkerBase):
                     # model is placed back on HPU).
                     gc.collect()
                     torch.hpu.synchronize()
-                    hpu_free_after_weights = None
-                    with contextlib.suppress(Exception):
-                        free_b, total_b = torch.hpu.mem_get_info()
-                        hpu_free_after_weights = free_b / (1024**3)
-                    logger.info(
-                        "[wake_up] model.to(hpu) done; HPU free before stray-tensor move: %s GiB",
-                        f"{hpu_free_after_weights:.2f}" if hpu_free_after_weights is not None else "?",
-                    )
                     # Re-derive MoeMatmul.weight slices from the now-moved
                     # parent FusedMoE registered params (w13_weight/w2_weight)
                     # BEFORE the stray scan.  MoeMatmul.weight is a stale CPU
